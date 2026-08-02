@@ -214,3 +214,132 @@ fn not_a_repo_exits_2() {
     let tmp = TempDir::new().unwrap();
     barber(tmp.path()).assert().code(2);
 }
+
+#[test]
+fn yes_deletes_merged_and_squash_but_not_gone_or_active() {
+    let (_tmp, origin, dir) = repo_with_origin();
+    // merged via merge commit
+    git(&dir, &["checkout", "-b", "merged-one"]);
+    commit_file(&dir, "m.txt", "m", "merged work");
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--no-ff", "merged-one", "-m", "merge"]);
+    // squash-merged
+    git(&dir, &["checkout", "-b", "squashed-one"]);
+    commit_file(&dir, "s.txt", "s", "squashed work");
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--squash", "squashed-one"]);
+    git(&dir, &["commit", "-m", "squash"]);
+    git(&dir, &["push", "origin", "main"]);
+    // gone upstream, unmerged content
+    git(&dir, &["checkout", "-b", "gone-one"]);
+    commit_file(&dir, "g.txt", "g", "gone work");
+    git(&dir, &["push", "-u", "origin", "gone-one"]);
+    git(&dir, &["checkout", "main"]);
+    git(&origin, &["branch", "-D", "gone-one"]);
+    git(&dir, &["fetch", "--prune"]);
+    // active, untouched
+    git(&dir, &["checkout", "-b", "active-one"]);
+    commit_file(&dir, "a.txt", "a", "active work");
+    git(&dir, &["checkout", "main"]);
+
+    barber(&dir)
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("merged-one"))
+        .stdout(predicates::str::contains("undo:"));
+
+    let left = git(&dir, &["branch", "--format=%(refname:short)"]);
+    let left: Vec<&str> = left.lines().collect();
+    assert_eq!(
+        left,
+        vec!["active-one", "gone-one", "main"],
+        "only merged+squash must go"
+    );
+}
+
+#[test]
+fn include_gone_extends_yes_to_gone_branches() {
+    let (_tmp, origin, dir) = repo_with_origin();
+    git(&dir, &["checkout", "-b", "gone-one"]);
+    commit_file(&dir, "g.txt", "g", "gone work");
+    git(&dir, &["push", "-u", "origin", "gone-one"]);
+    git(&dir, &["checkout", "main"]);
+    git(&origin, &["branch", "-D", "gone-one"]);
+    git(&dir, &["fetch", "--prune"]);
+
+    barber(&dir)
+        .args(["--yes", "--include-gone"])
+        .assert()
+        .success();
+    let left = git(&dir, &["branch", "--format=%(refname:short)"]);
+    assert_eq!(left.lines().collect::<Vec<_>>(), vec!["main"]);
+}
+
+#[test]
+fn remote_flag_deletes_the_remote_counterpart_too() {
+    let (_tmp, origin, dir) = repo_with_origin();
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "f.txt", "f", "feature work");
+    git(&dir, &["push", "-u", "origin", "feature"]);
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--no-ff", "feature", "-m", "merge"]);
+    git(&dir, &["push", "origin", "main"]);
+
+    let out = barber(&dir)
+        .args(["--yes", "--remote", "--json"])
+        .assert()
+        .success();
+    let json: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(json["results"][0]["remote"]["status"], "deleted");
+
+    let remote_branches = git(&origin, &["branch", "--format=%(refname:short)"]);
+    assert_eq!(
+        remote_branches.lines().collect::<Vec<_>>(),
+        vec!["main"],
+        "gone from origin too"
+    );
+    let local = git(&dir, &["branch", "--format=%(refname:short)"]);
+    assert_eq!(local.lines().collect::<Vec<_>>(), vec!["main"]);
+}
+
+#[test]
+fn gentle_delete_falls_back_to_verified_force_from_another_branch() {
+    let (_tmp, _origin, dir) = repo_with_origin();
+    // `other` diverges from the initial commit and never sees the merge.
+    git(&dir, &["branch", "other", "main"]);
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "f.txt", "f", "feature work");
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--no-ff", "feature", "-m", "merge"]);
+    git(&dir, &["push", "origin", "main"]);
+    // From `other`, plain `git branch -d feature` refuses (not merged into
+    // HEAD); the tool must verify against origin/main and force.
+    git(&dir, &["checkout", "other"]);
+
+    barber(&dir)
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("force-deleted (verified merged)"));
+    let left = git(&dir, &["branch", "--format=%(refname:short)"]);
+    assert_eq!(left.lines().collect::<Vec<_>>(), vec!["main", "other"]);
+}
+
+#[test]
+fn undo_hint_actually_restores_the_branch() {
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "f.txt", "f", "feature work");
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--no-ff", "feature", "-m", "merge"]);
+    let sha = git(&dir, &["rev-parse", "feature"]).trim().to_string();
+
+    let out = barber(&dir).args(["--yes", "--json"]).assert().success();
+    let json: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let undo = json["results"][0]["undo"][0].as_str().unwrap().to_string();
+    let undo_args: Vec<&str> = undo.split_whitespace().skip(1).collect();
+
+    git(&dir, &undo_args);
+    assert_eq!(git(&dir, &["rev-parse", "feature"]).trim(), sha);
+}

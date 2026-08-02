@@ -1,5 +1,6 @@
 mod cli;
 mod git;
+mod ops;
 mod output;
 mod scan;
 
@@ -43,7 +44,42 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Mode::Execute => anyhow::bail!("--yes is not implemented yet"),
+        Mode::Execute => {
+            let plans: Vec<ops::PlannedDeletion> = scan
+                .candidates
+                .iter()
+                .filter(|c| {
+                    c.selected_by_default() || (cli.include_gone && c.kind == scan::MergeKind::Gone)
+                })
+                .map(|c| ops::PlannedDeletion {
+                    candidate: c.clone(),
+                    delete_remote: cli.remote,
+                })
+                .collect();
+
+            if plans.is_empty() {
+                // Nothing auto-deletable; still show what exists (gone-only
+                // repos get the list plus the consent tip).
+                if cli.json {
+                    println!("{}", output::json_execute(&scan.base, &[])?);
+                } else {
+                    print!("{}", output::human_list(&scan, now_unix()));
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let results = ops::execute(&git, &scan.base, &plans);
+            if cli.json {
+                println!("{}", output::json_execute(&scan.base, &results)?);
+            } else {
+                print!("{}", output::human_execute(&scan.base, &results));
+            }
+            Ok(if results.iter().any(ops::DeletionResult::failed) {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
         Mode::Tui => anyhow::bail!("the TUI is not implemented yet; try --list"),
     }
 }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::ops;
 use crate::scan::{Candidate, MergeKind, Scan};
 
 pub fn human_list(scan: &Scan, now_unix: i64) -> String {
@@ -86,6 +87,46 @@ pub fn json_list(scan: &Scan) -> Result<String> {
             .collect(),
     };
     Ok(serde_json::to_string_pretty(&report)?)
+}
+
+pub fn human_execute(base: &str, results: &[ops::DeletionResult]) -> String {
+    let mut out = format!("base: {base}\n");
+    let name_w = results.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    for r in results {
+        let local = match &r.local {
+            ops::LocalOutcome::Deleted => "deleted".to_string(),
+            ops::LocalOutcome::ForceDeleted => "force-deleted (verified merged)".to_string(),
+            ops::LocalOutcome::Failed(msg) => format!("FAILED: {msg}"),
+        };
+        let remote = match &r.remote {
+            ops::RemoteOutcome::Deleted { remote } => format!(", deleted on {remote}"),
+            ops::RemoteOutcome::Skipped => String::new(),
+            ops::RemoteOutcome::Failed(msg) => format!(", remote FAILED: {msg}"),
+        };
+        out.push_str(&format!("  {:name_w$}  {local}{remote}\n", r.name));
+    }
+
+    let undo: Vec<&String> = results.iter().flat_map(|r| &r.undo).collect();
+    if !undo.is_empty() {
+        out.push_str("\nundo:\n");
+        for u in undo {
+            out.push_str(&format!("  {u}\n"));
+        }
+    }
+    out
+}
+
+#[derive(Serialize)]
+struct ExecuteJson<'a> {
+    base: &'a str,
+    results: &'a [ops::DeletionResult],
+}
+
+pub fn json_execute(base: &str, results: &[ops::DeletionResult]) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&ExecuteJson {
+        base,
+        results,
+    })?)
 }
 
 /// Compact human age: 5m, 3h, 5d, 2w, 3mo, 1y.
