@@ -3,13 +3,25 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test
-      - run: cargo publish
+        with:
+          components: rustfmt, clippy
+      - name: Tag must match Cargo.toml version
+        run: |
+          manifest=$(cargo pkgid | sed 's/.*[#@]//')
+          test "${GITHUB_REF_NAME#v}" = "$manifest" \
+            || { echo "tag $GITHUB_REF_NAME != version $manifest"; exit 1; }
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
