@@ -10,10 +10,10 @@ pub fn human_list(scan: &Scan, now_unix: i64) -> String {
         out.push_str(&format!("warning: {w}\n"));
     }
     if scan.candidates.is_empty() {
-        out.push_str(&format!("Nothing to trim (base: {}).\n", scan.base));
+        out.push_str(&format!("Nothing to trim (base: {}).\n", scan.base.name));
         return out;
     }
-    out.push_str(&format!("base: {}\n", scan.base));
+    out.push_str(&format!("base: {}\n", scan.base.name));
 
     let name_w = scan
         .candidates
@@ -55,6 +55,7 @@ pub fn kind_label(kind: MergeKind) -> &'static str {
     match kind {
         MergeKind::Merged => "merged",
         MergeKind::Squash => "squash",
+        MergeKind::Rebase => "rebase",
         MergeKind::Gone => "gone",
     }
 }
@@ -73,18 +74,21 @@ struct ListJson<'a> {
     branches: Vec<BranchJson<'a>>,
 }
 
+fn branches_json(scan: &Scan) -> Vec<BranchJson<'_>> {
+    scan.candidates
+        .iter()
+        .map(|c| BranchJson {
+            candidate: c,
+            selected_by_default: c.selected_by_default(),
+        })
+        .collect()
+}
+
 pub fn json_list(scan: &Scan) -> Result<String> {
     let report = ListJson {
-        base: &scan.base,
+        base: &scan.base.name,
         warnings: &scan.warnings,
-        branches: scan
-            .candidates
-            .iter()
-            .map(|c| BranchJson {
-                candidate: c,
-                selected_by_default: c.selected_by_default(),
-            })
-            .collect(),
+        branches: branches_json(scan),
     };
     Ok(serde_json::to_string_pretty(&report)?)
 }
@@ -99,7 +103,7 @@ pub fn human_execute(base: &str, results: &[ops::DeletionResult]) -> String {
             ops::LocalOutcome::Failed(msg) => format!("FAILED: {msg}"),
         };
         let remote = match &r.remote {
-            ops::RemoteOutcome::Deleted { remote } => format!(", deleted on {remote}"),
+            ops::RemoteOutcome::Deleted { target, .. } => format!(", deleted {target} on remote"),
             ops::RemoteOutcome::Skipped => String::new(),
             ops::RemoteOutcome::Failed(msg) => format!(", remote FAILED: {msg}"),
         };
@@ -112,19 +116,26 @@ pub fn human_execute(base: &str, results: &[ops::DeletionResult]) -> String {
         for u in undo {
             out.push_str(&format!("  {u}\n"));
         }
+        out.push_str("(recent tips also linger in `git reflog` for a while)\n");
     }
     out
 }
 
+/// The --yes --json report always carries the full candidate list, so
+/// scripts can tell "clean repo" from "gone branches awaiting consent".
 #[derive(Serialize)]
 struct ExecuteJson<'a> {
     base: &'a str,
+    warnings: &'a [String],
+    candidates: Vec<BranchJson<'a>>,
     results: &'a [ops::DeletionResult],
 }
 
-pub fn json_execute(base: &str, results: &[ops::DeletionResult]) -> Result<String> {
+pub fn json_execute(scan: &Scan, results: &[ops::DeletionResult]) -> Result<String> {
     Ok(serde_json::to_string_pretty(&ExecuteJson {
-        base,
+        base: &scan.base.name,
+        warnings: &scan.warnings,
+        candidates: branches_json(scan),
         results,
     })?)
 }
@@ -146,6 +157,7 @@ pub(crate) fn age(now: i64, then: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::Base;
 
     #[test]
     fn ages() {
@@ -157,9 +169,17 @@ mod tests {
         assert_eq!(age(86_400 * 800, 0), "2y");
     }
 
+    fn base() -> Base {
+        Base {
+            name: "origin/main".into(),
+            refname: Some("refs/remotes/origin/main".into()),
+        }
+    }
+
     fn candidate(name: &str, kind: MergeKind) -> Candidate {
         Candidate {
             name: name.into(),
+            refname: format!("refs/heads/{name}"),
             sha: "abc123".into(),
             kind,
             upstream: Some(format!("origin/{name}")),
@@ -167,20 +187,21 @@ mod tests {
             upstream_gone: kind == MergeKind::Gone,
             last_commit_unix: 0,
             subject: "subject".into(),
+            upstream_ref: Some(format!("refs/remotes/origin/{name}")),
         }
     }
 
     #[test]
     fn human_list_empty_and_full() {
         let scan = Scan {
-            base: "origin/main".into(),
+            base: base(),
             candidates: vec![],
             warnings: vec![],
         };
         assert!(human_list(&scan, 0).contains("Nothing to trim"));
 
         let scan = Scan {
-            base: "origin/main".into(),
+            base: base(),
             candidates: vec![
                 candidate("a", MergeKind::Merged),
                 candidate("b", MergeKind::Gone),
@@ -195,15 +216,42 @@ mod tests {
     }
 
     #[test]
-    fn json_shape() {
+    fn json_shapes() {
         let scan = Scan {
-            base: "origin/main".into(),
-            candidates: vec![candidate("a", MergeKind::Squash)],
+            base: base(),
+            candidates: vec![candidate("a", MergeKind::Rebase)],
             warnings: vec![],
         };
         let value: serde_json::Value = serde_json::from_str(&json_list(&scan).unwrap()).unwrap();
         assert_eq!(value["base"], "origin/main");
-        assert_eq!(value["branches"][0]["kind"], "squash");
+        assert_eq!(value["branches"][0]["kind"], "rebase");
         assert_eq!(value["branches"][0]["selected_by_default"], true);
+
+        // --yes --json with nothing deleted still reports the candidates.
+        let value: serde_json::Value =
+            serde_json::from_str(&json_execute(&scan, &[]).unwrap()).unwrap();
+        assert_eq!(value["candidates"][0]["name"], "a");
+        assert_eq!(value["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn execute_report_shows_remote_target_and_undo() {
+        let results = vec![ops::DeletionResult {
+            name: "local-copy".into(),
+            sha: "abc123".into(),
+            local: ops::LocalOutcome::Deleted,
+            remote: ops::RemoteOutcome::Deleted {
+                target: "origin/shared".into(),
+                sha: "def456".into(),
+            },
+            undo: vec![
+                "git branch local-copy abc123".into(),
+                "git push origin def456:refs/heads/shared".into(),
+            ],
+        }];
+        let text = human_execute("origin/main", &results);
+        assert!(text.contains("deleted origin/shared on remote"), "{text}");
+        assert!(text.contains("undo:"));
+        assert!(text.contains("git reflog"));
     }
 }

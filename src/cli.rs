@@ -15,7 +15,7 @@ pub struct Cli {
     pub base: Option<String>,
 
     /// Print candidates and exit without deleting (implied when not a TTY)
-    #[arg(long, visible_alias = "dry-run")]
+    #[arg(long, visible_alias = "dry-run", conflicts_with = "yes")]
     pub list: bool,
 
     /// Machine-readable JSON output (implies --list unless combined with --yes)
@@ -27,12 +27,13 @@ pub struct Cli {
     pub yes: bool,
 
     /// Also delete the remote counterpart of each deleted branch (destructive:
-    /// affects everyone using the remote)
+    /// affects everyone using the remote). In the TUI this pre-arms the `r`
+    /// toggle on every candidate with a live upstream
     #[arg(long)]
     pub remote: bool,
 
     /// With --yes: also delete branches whose upstream is gone
-    #[arg(long)]
+    #[arg(long, requires = "yes")]
     pub include_gone: bool,
 
     /// Extra protected branch names or globs like 'release/*'
@@ -41,7 +42,7 @@ pub struct Cli {
     #[arg(long, value_name = "PATTERN", value_delimiter = ',')]
     pub protect: Vec<String>,
 
-    /// Run `git fetch --prune origin` before scanning
+    /// Run `git fetch --prune` before scanning (non-fatal when offline)
     #[arg(long)]
     pub fetch: bool,
 
@@ -99,10 +100,20 @@ mod tests {
     }
 
     #[test]
-    fn yes_wins_over_everything() {
-        let cli = parse(&["--yes", "--json", "--list"]);
+    fn dry_run_and_delete_flags_conflict() {
+        // A --dry-run appended to a scripted --yes must error out loudly,
+        // never silently delete.
+        assert!(Cli::try_parse_from(["git-barber", "--yes", "--list"]).is_err());
+        assert!(Cli::try_parse_from(["git-barber", "--yes", "--dry-run"]).is_err());
+        // --json --yes stays valid: it is the JSON result report.
+        let cli = parse(&["--yes", "--json"]);
         assert_eq!(cli.mode_with(true), Mode::Execute);
-        assert_eq!(cli.mode_with(false), Mode::Execute);
+    }
+
+    #[test]
+    fn include_gone_requires_yes() {
+        assert!(Cli::try_parse_from(["git-barber", "--include-gone"]).is_err());
+        assert!(Cli::try_parse_from(["git-barber", "--yes", "--include-gone"]).is_ok());
     }
 
     #[test]

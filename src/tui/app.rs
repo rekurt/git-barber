@@ -1,7 +1,8 @@
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::widgets::ListState;
 
 use crate::ops::{self, DeletionResult, PlannedDeletion};
-use crate::scan::{Candidate, Scan};
+use crate::scan::{Base, Candidate, Scan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -29,13 +30,19 @@ pub enum Action {
 }
 
 pub struct App {
-    pub base: String,
+    pub base: Base,
     pub items: Vec<Item>,
     pub cursor: usize,
     pub screen: Screen,
     pub results: Vec<DeletionResult>,
     pub should_quit: bool,
     pub now_unix: i64,
+    pub warnings: Vec<String>,
+    /// Branch currently being deleted (shown while the batch runs).
+    pub in_flight: Option<String>,
+    pub results_scroll: u16,
+    /// Owned by App so the list's scroll offset survives between frames.
+    pub list_state: ListState,
 }
 
 impl App {
@@ -57,18 +64,43 @@ impl App {
             results: Vec::new(),
             should_quit: false,
             now_unix,
+            warnings: scan.warnings,
+            in_flight: None,
+            results_scroll: 0,
+            list_state: ListState::default(),
         }
     }
 
     /// Pure state transition: no I/O, no terminal. Fully unit-testable.
     pub fn update(&mut self, key: KeyEvent) -> Option<Action> {
+        // Raw mode swallows SIGINT, so honor Ctrl+C ourselves — everywhere.
+        // Every other modified key is dropped: Ctrl+N must not alias to the
+        // plain 'n' (deselect all) arm.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            {
+                self.should_quit = true;
+            }
+            return None;
+        }
         match self.screen {
             Screen::List => self.update_list(key),
             Screen::Confirm => self.update_confirm(key),
             Screen::Deleting => None, // the driver is busy; ignore input
             Screen::Results => {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter) {
-                    self.should_quit = true;
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.results_scroll = self.results_scroll.saturating_add(1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.results_scroll = self.results_scroll.saturating_sub(1);
+                    }
+                    _ => {}
                 }
                 None
             }
@@ -137,6 +169,7 @@ impl App {
     }
 
     pub fn finish(&mut self) {
+        self.in_flight = None;
         self.screen = Screen::Results;
     }
 
@@ -169,9 +202,14 @@ mod tests {
         KeyEvent::from(code)
     }
 
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
     fn candidate(name: &str, kind: MergeKind) -> Candidate {
         Candidate {
             name: name.into(),
+            refname: format!("refs/heads/{name}"),
             sha: "0123456789abcdef0123".into(),
             kind,
             upstream: (kind != MergeKind::Gone).then(|| format!("origin/{name}")),
@@ -179,12 +217,16 @@ mod tests {
             upstream_gone: kind == MergeKind::Gone,
             last_commit_unix: 0,
             subject: "subject".into(),
+            upstream_ref: (kind != MergeKind::Gone).then(|| format!("refs/remotes/origin/{name}")),
         }
     }
 
     fn app() -> App {
         let scan = Scan {
-            base: "origin/main".into(),
+            base: Base {
+                name: "origin/main".into(),
+                refname: Some("refs/remotes/origin/main".into()),
+            },
             candidates: vec![
                 candidate("merged-a", MergeKind::Merged),
                 candidate("squash-b", MergeKind::Squash),
@@ -202,6 +244,26 @@ mod tests {
         assert_eq!(sel, vec![true, true, false]);
         assert_eq!(app.selected_count(), 2);
         assert_eq!(app.force_count(), 1); // the squash one
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_screen() {
+        for screen in [Screen::List, Screen::Confirm, Screen::Results] {
+            let mut app = app();
+            app.screen = screen;
+            assert!(app.update(ctrl('c')).is_none());
+            assert!(app.should_quit, "Ctrl+C must quit from {screen:?}");
+        }
+    }
+
+    #[test]
+    fn modified_keys_do_not_alias_to_plain_letters() {
+        let mut app = app();
+        app.update(ctrl('n')); // Ctrl+N is "next" muscle memory, not deselect-all
+        assert_eq!(app.selected_count(), 2, "Ctrl+N must not deselect");
+        app.update(ctrl('a'));
+        assert_eq!(app.selected_count(), 2, "Ctrl+A must not select all");
+        assert!(!app.should_quit);
     }
 
     #[test]
@@ -288,9 +350,18 @@ mod tests {
     }
 
     #[test]
-    fn results_screen_exits_on_q() {
+    fn results_screen_scrolls_and_exits_on_q_but_not_enter() {
         let mut app = app();
         app.finish();
+        app.update(key(KeyCode::Enter));
+        assert!(
+            !app.should_quit,
+            "a queued Enter from the confirm screen must not dismiss results"
+        );
+        app.update(key(KeyCode::Char('j')));
+        app.update(key(KeyCode::Char('j')));
+        app.update(key(KeyCode::Char('k')));
+        assert_eq!(app.results_scroll, 1);
         app.update(key(KeyCode::Char('q')));
         assert!(app.should_quit);
     }

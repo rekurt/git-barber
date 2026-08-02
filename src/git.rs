@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -12,6 +13,9 @@ pub trait Git {
     /// Run git where a non-zero exit is an expected answer (e.g.
     /// `rev-parse --verify`). Returns `(success, stdout-or-stderr)`.
     fn try_run(&self, args: &[&str]) -> Result<(bool, String)>;
+
+    /// Run git with `input` piped to stdin (e.g. `git patch-id`).
+    fn run_with_input(&self, args: &[&str], input: &str) -> Result<String>;
 }
 
 /// Real implementation shelling out to the system `git`.
@@ -30,19 +34,21 @@ impl SystemGit {
             cmd.arg("-C").arg(dir);
         }
         cmd.args(args);
-        // Never hang on interactive credential prompts; fail fast instead.
-        // Critical while the TUI owns the terminal.
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
-        if args.first() == Some(&"commit-tree") {
-            // The squash probe creates a dangling commit; a fixed identity
-            // keeps it working in repos with no user.name/email configured
-            // and makes probe OIDs deterministic.
-            cmd.env("GIT_AUTHOR_NAME", "git-barber");
-            cmd.env("GIT_AUTHOR_EMAIL", "barber@localhost");
-            cmd.env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z");
-            cmd.env("GIT_COMMITTER_NAME", "git-barber");
-            cmd.env("GIT_COMMITTER_EMAIL", "barber@localhost");
-            cmd.env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z");
+        // An inherited GIT_DIR would silently override `-C` and point every
+        // command at the ambient repository (hooks, `rebase -x`, IDE tasks).
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            cmd.env_remove(var);
+        }
+        // Never hang on credential prompts while the TUI owns the terminal.
+        // `fetch` is the exception: it runs before the TUI starts, and the
+        // user explicitly asked for network access, so prompting is fine.
+        if args.first() != Some(&"fetch") {
+            cmd.env("GIT_TERMINAL_PROMPT", "0");
         }
         cmd
     }
@@ -80,6 +86,38 @@ impl Git for SystemGit {
         };
         Ok((out.status.success(), text))
     }
+
+    fn run_with_input(&self, args: &[&str], input: &str) -> Result<String> {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to launch `git {}` — is git on PATH?",
+                    args.join(" ")
+                )
+            })?;
+        // Feed stdin from a thread so a filled stdout pipe can't deadlock us.
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        let payload = input.to_string();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(payload.as_bytes()); // EPIPE = child exited early; fine
+        });
+        let out = child.wait_with_output()?;
+        let _ = writer.join();
+        if !out.status.success() {
+            bail!(
+                "`git {}` failed ({}): {}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
 }
 
 #[cfg(test)]
@@ -88,16 +126,35 @@ pub mod fake {
     use anyhow::{Result, bail};
     use std::collections::HashMap;
 
-    /// Canned-response fake: maps a full argv to Ok(stdout) or Err(stderr).
+    /// Canned-response fake: maps a full argv (and optionally stdin) to
+    /// Ok(stdout) or Err(stderr).
     #[derive(Default)]
     pub struct FakeGit {
         responses: HashMap<Vec<String>, Result<String, String>>,
+        input_responses: HashMap<(Vec<String>, String), Result<String, String>>,
     }
 
     impl FakeGit {
         pub fn on(mut self, args: &[&str], response: Result<&str, &str>) -> Self {
             self.responses.insert(
                 args.iter().map(|s| s.to_string()).collect(),
+                response.map(str::to_string).map_err(str::to_string),
+            );
+            self
+        }
+
+        /// Canned response for `run_with_input` matched on (args, exact stdin).
+        pub fn on_input(
+            mut self,
+            args: &[&str],
+            input: &str,
+            response: Result<&str, &str>,
+        ) -> Self {
+            self.input_responses.insert(
+                (
+                    args.iter().map(|s| s.to_string()).collect(),
+                    input.to_string(),
+                ),
                 response.map(str::to_string).map_err(str::to_string),
             );
             self
@@ -120,6 +177,22 @@ pub mod fake {
                 Some(Ok(out)) => Ok((true, out.clone())),
                 Some(Err(err)) => Ok((false, err.clone())),
                 None => bail!("FakeGit: unexpected call `git {}`", args.join(" ")),
+            }
+        }
+
+        fn run_with_input(&self, args: &[&str], input: &str) -> Result<String> {
+            let key = (
+                args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                input.to_string(),
+            );
+            match self.input_responses.get(&key) {
+                Some(Ok(out)) => Ok(out.clone()),
+                Some(Err(err)) => bail!("`git {}` failed: {err}", args.join(" ")),
+                None => bail!(
+                    "FakeGit: unexpected call `git {}` with input {:?}",
+                    args.join(" "),
+                    input
+                ),
             }
         }
     }

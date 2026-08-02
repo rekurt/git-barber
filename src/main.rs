@@ -29,12 +29,19 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
     // Fail early with a clear message when we're not inside a repository.
     git.run(&["rev-parse", "--git-dir"])?;
 
-    if cli.fetch {
-        // Before the TUI takes the terminal, so credential helpers can prompt.
-        git.run(&["fetch", "--prune", "--quiet", "origin"])?;
+    // Fetch runs before the TUI takes the terminal, so credential helpers can
+    // still prompt. Offline must not block a purely local scan.
+    let mut fetch_warning = None;
+    if cli.fetch
+        && let Err(err) = git.run(&["fetch", "--prune", "--quiet"])
+    {
+        let warning = format!("fetch failed, scanning with possibly stale remote refs: {err:#}");
+        eprintln!("warning: {warning}");
+        fetch_warning = Some(warning);
     }
 
-    let scan = scan::scan(&git, cli.base.as_deref(), &cli.protect)?;
+    let mut scan = scan::scan(&git, cli.base.as_deref(), &cli.protect)?;
+    scan.warnings.extend(fetch_warning);
 
     match cli.mode() {
         Mode::List => {
@@ -62,7 +69,7 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
                 // Nothing auto-deletable; still show what exists (gone-only
                 // repos get the list plus the consent tip).
                 if cli.json {
-                    println!("{}", output::json_execute(&scan.base, &[])?);
+                    println!("{}", output::json_execute(&scan, &[])?);
                 } else {
                     print!("{}", output::human_list(&scan, now_unix()));
                 }
@@ -71,9 +78,9 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
 
             let results = ops::execute(&git, &scan.base, &plans);
             if cli.json {
-                println!("{}", output::json_execute(&scan.base, &results)?);
+                println!("{}", output::json_execute(&scan, &results)?);
             } else {
-                print!("{}", output::human_execute(&scan.base, &results));
+                print!("{}", output::human_execute(&scan.base.name, &results));
             }
             Ok(if results.iter().any(ops::DeletionResult::failed) {
                 ExitCode::from(1)
