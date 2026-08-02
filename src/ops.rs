@@ -35,6 +35,7 @@ pub enum RemoteOutcome {
 pub struct DeletionResult {
     pub name: String,
     pub sha: String,
+    pub kind: crate::scan::MergeKind,
     pub local: LocalOutcome,
     pub remote: RemoteOutcome,
     /// Copy-pasteable commands that restore what was deleted.
@@ -101,6 +102,7 @@ pub fn delete_one(
     DeletionResult {
         name: c.name.clone(),
         sha: c.sha.clone(),
+        kind: c.kind,
         local,
         remote,
         undo,

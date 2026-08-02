@@ -216,16 +216,13 @@ fn render_results(frame: &mut Frame, app: &mut App) {
             "  {:name_w$}  ",
             clip(&r.name, MAX_NAME_W)
         ))];
-        match &r.local {
-            LocalOutcome::Deleted => {
-                spans.push(Span::styled("deleted", Style::new().fg(Color::Green)))
-            }
-            LocalOutcome::ForceDeleted => spans.push(Span::styled(
-                "force-deleted (verified merged)",
-                Style::new().fg(Color::Green),
-            )),
-            LocalOutcome::Failed(msg) => spans.push(Span::styled(format!("FAILED: {msg}"), RED)),
-        }
+        let label = crate::output::local_label(r);
+        let style = if matches!(r.local, LocalOutcome::Failed(_)) {
+            RED
+        } else {
+            Style::new().fg(Color::Green)
+        };
+        spans.push(Span::styled(label, style));
         match &r.remote {
             RemoteOutcome::Deleted { target, .. } => {
                 spans.push(Span::styled(format!(", deleted {target} on remote"), RED))
@@ -390,6 +387,7 @@ mod tests {
         app.apply_result(crate::ops::DeletionResult {
             name: "merged-a".into(),
             sha: "0123456789abcdef0123".into(),
+            kind: MergeKind::Merged,
             local: LocalOutcome::Deleted,
             remote: RemoteOutcome::Deleted {
                 target: "origin/merged-a".into(),

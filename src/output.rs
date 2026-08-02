@@ -93,15 +93,29 @@ pub fn json_list(scan: &Scan) -> Result<String> {
     Ok(serde_json::to_string_pretty(&report)?)
 }
 
+/// Human label for a local outcome; the force wording depends on WHY the
+/// force was justified (a gone branch is consented-to, not verified).
+pub(crate) fn local_label(r: &ops::DeletionResult) -> String {
+    match (&r.local, r.kind) {
+        (ops::LocalOutcome::Deleted, _) => "deleted".to_string(),
+        (ops::LocalOutcome::ForceDeleted, MergeKind::Merged) => {
+            "force-deleted (verified merged into base)".to_string()
+        }
+        (ops::LocalOutcome::ForceDeleted, MergeKind::Squash | MergeKind::Rebase) => {
+            "force-deleted (patch-id verified)".to_string()
+        }
+        (ops::LocalOutcome::ForceDeleted, MergeKind::Gone) => {
+            "force-deleted (upstream was gone)".to_string()
+        }
+        (ops::LocalOutcome::Failed(msg), _) => format!("FAILED: {msg}"),
+    }
+}
+
 pub fn human_execute(base: &str, results: &[ops::DeletionResult]) -> String {
     let mut out = format!("base: {base}\n");
     let name_w = results.iter().map(|r| r.name.len()).max().unwrap_or(0);
     for r in results {
-        let local = match &r.local {
-            ops::LocalOutcome::Deleted => "deleted".to_string(),
-            ops::LocalOutcome::ForceDeleted => "force-deleted (verified merged)".to_string(),
-            ops::LocalOutcome::Failed(msg) => format!("FAILED: {msg}"),
-        };
+        let local = local_label(r);
         let remote = match &r.remote {
             ops::RemoteOutcome::Deleted { target, .. } => format!(", deleted {target} on remote"),
             ops::RemoteOutcome::Skipped => String::new(),
@@ -239,6 +253,7 @@ mod tests {
         let results = vec![ops::DeletionResult {
             name: "local-copy".into(),
             sha: "abc123".into(),
+            kind: MergeKind::Merged,
             local: ops::LocalOutcome::Deleted,
             remote: ops::RemoteOutcome::Deleted {
                 target: "origin/shared".into(),

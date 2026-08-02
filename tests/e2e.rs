@@ -507,7 +507,9 @@ fn gentle_delete_falls_back_to_verified_force_from_another_branch() {
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicates::str::contains("force-deleted (verified merged)"));
+        .stdout(predicates::str::contains(
+            "force-deleted (verified merged into base)",
+        ));
     let left = git(&dir, &["branch", "--format=%(refname:short)"]);
     assert_eq!(left.lines().collect::<Vec<_>>(), vec!["main", "other"]);
 }
