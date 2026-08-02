@@ -1,7 +1,9 @@
 use serde::Serialize;
 
 use crate::git::Git;
-use crate::scan::{Candidate, MergeKind};
+use crate::scan::Candidate;
+#[cfg(test)]
+use crate::scan::MergeKind;
 
 pub struct PlannedDeletion {
     pub candidate: Candidate,
@@ -162,7 +164,7 @@ pub fn remote_branch(c: &Candidate) -> Option<(String, String)> {
     Some((remote, branch))
 }
 
-fn current_branch(git: &dyn Git) -> Option<String> {
+pub(crate) fn current_branch(git: &dyn Git) -> Option<String> {
     match git.try_run(&["symbolic-ref", "--quiet", "--short", "HEAD"]) {
         Ok((true, out)) => Some(out.trim().to_string()),
         _ => None,

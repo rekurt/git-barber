@@ -130,7 +130,7 @@ pub fn json_execute(base: &str, results: &[ops::DeletionResult]) -> Result<Strin
 }
 
 /// Compact human age: 5m, 3h, 5d, 2w, 3mo, 1y.
-fn age(now: i64, then: i64) -> String {
+pub(crate) fn age(now: i64, then: i64) -> String {
     let days = (now - then).max(0) / 86_400;
     let hours = (now - then).max(0) / 3_600;
     match days {

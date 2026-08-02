@@ -3,6 +3,7 @@ mod git;
 mod ops;
 mod output;
 mod scan;
+mod tui;
 
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -80,7 +81,14 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
                 ExitCode::SUCCESS
             })
         }
-        Mode::Tui => anyhow::bail!("the TUI is not implemented yet; try --list"),
+        Mode::Tui => {
+            if scan.candidates.is_empty() {
+                // Don't take over the terminal just to say there's no work.
+                print!("{}", output::human_list(&scan, now_unix()));
+                return Ok(ExitCode::SUCCESS);
+            }
+            tui::run(&git, scan, cli.remote, now_unix())
+        }
     }
 }
 
