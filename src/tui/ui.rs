@@ -203,7 +203,7 @@ fn render_confirm(frame: &mut Frame, app: &App) {
             Block::bordered()
                 .title(" confirm deletion ")
                 // Bottom title so the way out is visible even when clipped.
-                .title_bottom(Line::from(" y confirm · esc cancel ")),
+                .title_bottom(Line::from(" y confirm · n/q/esc cancel ")),
         ),
         area,
     );

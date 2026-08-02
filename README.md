@@ -132,9 +132,9 @@ terminal in raw mode (`reset` fixes it).
 git-barber shells out to your system `git` (like `gh` does), so hooks and
 config behave the way your git does. Two deliberate exceptions: repo-selecting
 environment variables (`GIT_DIR` & co) are cleared so `-C` always wins, and
-interactive credential prompts are disabled while the TUI owns the terminal —
-use `--fetch` (which may prompt) or a credential helper for remotes that
-need auth.
+interactive credential prompts are disabled for every git call except
+`--fetch` — remote deletion needs a non-interactive credential helper
+configured, and fails fast instead of hanging when there is none.
 
 ## Development
 

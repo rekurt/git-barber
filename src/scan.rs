@@ -187,17 +187,11 @@ fn resolve_base(git: &dyn Git, flag: Option<&str>) -> Result<Base> {
         if !ok {
             bail!("--base {name} does not resolve to a commit");
         }
+        // --symbolic-full-name resolves symrefs to the terminal ref, so
+        // `--base origin/HEAD` already yields e.g. refs/remotes/origin/main
+        // and the exclusion logic protects the right branch.
         let (ok, full) = git.try_run(&["rev-parse", "--symbolic-full-name", name])?;
-        let mut full = full.trim().to_string();
-        // `--base origin/HEAD` (or plain `origin`) yields a symref; exclusion
-        // logic needs the branch it points at, or the local default branch
-        // would be left unprotected.
-        if ok
-            && !full.is_empty()
-            && let (true, target) = git.try_run(&["symbolic-ref", "--quiet", &full])?
-        {
-            full = target.trim().to_string();
-        }
+        let full = full.trim().to_string();
         return Ok(Base {
             name: name.to_string(),
             refname: (ok && !full.is_empty()).then_some(full),
@@ -323,16 +317,20 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 /// and immune to user config: `git log -p` is porcelain (honours
 /// diff.renames/algorithm/context/noprefix and color), `git diff-tree` is
 /// plumbing (honours none of them). Pin every knob on both.
-const DIFF_FLAGS: [&str; 9] = [
+const DIFF_FLAGS: [&str; 13] = [
     "--no-color",
     "--no-ext-diff",
     "--no-textconv",
     "--no-renames",
+    "--no-relative", // diff.relative + a subdir cwd would drop hunks from log -p
     "--full-index",
     "--diff-algorithm=myers",
     "-U3",
+    "--inter-hunk-context=0",
     "--src-prefix=a/",
     "--dst-prefix=b/",
+    "--submodule=short",
+    "--ignore-submodules=none",
 ];
 
 fn with_diff_flags(prefix: &[&str], range: &str) -> Vec<String> {
@@ -494,30 +492,11 @@ mod tests {
             .on(
                 &["rev-parse", "--symbolic-full-name", "topic"],
                 Ok("refs/heads/topic\n"),
-            )
-            .on(&["symbolic-ref", "--quiet", "refs/heads/topic"], Err(""));
+            );
         let base = resolve_base(&git, Some("topic")).unwrap();
         assert_eq!(base.name, "topic");
         assert_eq!(base.refname.as_deref(), Some("refs/heads/topic"));
         assert_eq!(base.rev(), "refs/heads/topic");
-
-        // --base origin/HEAD is a symref: it must deref to the real branch,
-        // or the local default branch would be left unprotected.
-        let git = FakeGit::default()
-            .on(
-                &["rev-parse", "--verify", "--quiet", "origin/HEAD^{commit}"],
-                Ok("abc\n"),
-            )
-            .on(
-                &["rev-parse", "--symbolic-full-name", "origin/HEAD"],
-                Ok("refs/remotes/origin/HEAD\n"),
-            )
-            .on(
-                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-                Ok("refs/remotes/origin/trunk\n"),
-            );
-        let base = resolve_base(&git, Some("origin/HEAD")).unwrap();
-        assert_eq!(base.refname.as_deref(), Some("refs/remotes/origin/trunk"));
 
         // A raw SHA base has no refname but still works.
         let git = FakeGit::default()
