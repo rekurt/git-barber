@@ -41,6 +41,9 @@ impl SystemGit {
             "GIT_WORK_TREE",
             "GIT_INDEX_FILE",
             "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
         ] {
             cmd.env_remove(var);
         }

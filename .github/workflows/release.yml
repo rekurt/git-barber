@@ -16,7 +16,9 @@ jobs:
           components: rustfmt, clippy
       - name: Tag must match Cargo.toml version
         run: |
-          manifest=$(cargo pkgid | sed 's/.*[#@]//')
+          # --locked: pkgid must not silently repair a stale Cargo.lock that
+          # the later --locked steps are supposed to catch.
+          manifest=$(cargo pkgid --locked | sed 's/.*[#@]//')
           test "${GITHUB_REF_NAME#v}" = "$manifest" \
             || { echo "tag $GITHUB_REF_NAME != version $manifest"; exit 1; }
       - run: cargo fmt --all --check

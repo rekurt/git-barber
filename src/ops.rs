@@ -137,7 +137,7 @@ fn delete_local(git: &dyn Git, base: &Base, c: &Candidate) -> LocalOutcome {
             // `-d` judges merged-ness against HEAD/upstream, not our base.
             // If the verified tip is an ancestor of base, force with a clear
             // conscience; otherwise surface git's refusal.
-            match git.try_run(&["merge-base", "--is-ancestor", &c.sha, &base.name]) {
+            match git.try_run(&["merge-base", "--is-ancestor", &c.sha, base.rev()]) {
                 Ok((true, _)) => force_delete(git, c),
                 _ => LocalOutcome::Failed(first_err.trim().to_string()),
             }
@@ -319,7 +319,15 @@ mod tests {
                 &["branch", "-d", "--", "feat"],
                 Err("error: not fully merged"),
             )
-            .on(&["merge-base", "--is-ancestor", SHA, "origin/main"], Ok(""))
+            .on(
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    SHA,
+                    "refs/remotes/origin/main",
+                ],
+                Ok(""),
+            )
             .on(&["branch", "-D", "--", "feat"], Ok(""));
         let r = delete_one(
             &git,
@@ -335,7 +343,12 @@ mod tests {
                 Err("error: not fully merged"),
             )
             .on(
-                &["merge-base", "--is-ancestor", SHA, "origin/main"],
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    SHA,
+                    "refs/remotes/origin/main",
+                ],
                 Err(""),
             );
         let r = delete_one(

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
 use serde::Serialize;
@@ -9,7 +9,7 @@ use crate::git::Git;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeKind {
-    /// Tip is an ancestor of the base branch (`git branch --merged`).
+    /// Tip is an ancestor of the base branch (ancestry check).
     Merged,
     /// The branch squashed into one diff matches a patch already in base
     /// (GitHub "Squash and merge").
@@ -24,11 +24,20 @@ pub enum MergeKind {
 /// The branch everything is compared against.
 #[derive(Debug, Clone)]
 pub struct Base {
-    /// User-facing name, valid as a git rev (e.g. "origin/main").
+    /// User-facing name (e.g. "origin/main").
     pub name: String,
     /// Full refname when the base is a ref (e.g. "refs/remotes/origin/main").
     /// None when --base was given a raw commit.
     pub refname: Option<String>,
+}
+
+impl Base {
+    /// The rev to feed to git commands. The FULL name whenever we have one:
+    /// a local branch literally named "origin/main" would shadow the
+    /// remote-tracking ref under gitrevisions short-name resolution.
+    pub fn rev(&self) -> &str {
+        self.refname.as_deref().unwrap_or(&self.name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,7 +85,12 @@ pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) ->
     let base = resolve_base(git, base_flag)?;
     let current = current_branch(git)?;
     let protected = protected_patterns(git, extra_protect)?;
-    let shallow = git.run(&["rev-parse", "--is-shallow-repository"])?.trim() == "true";
+    // try_run: ancient git without --is-shallow-repository predates shallow
+    // clones being common; treat failure as "not shallow".
+    let shallow = matches!(
+        git.try_run(&["rev-parse", "--is-shallow-repository"])?,
+        (true, out) if out.trim() == "true"
+    );
     let held = worktree_branches(git)?;
 
     let mut warnings = Vec::new();
@@ -89,7 +103,7 @@ pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) ->
             "for-each-ref",
             "refs/heads",
             "--merged",
-            &base.name,
+            base.rev(),
             "--format=%(refname)",
         ])?
         .lines()
@@ -99,18 +113,20 @@ pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) ->
     // The local twin of a remote base: base `origin/main` → `refs/heads/main`.
     let base_local = base_local_counterpart(git, &base)?;
 
+    let mut upstream_cache = HashMap::new();
     let mut candidates = Vec::new();
     for line in git.run(&["for-each-ref", "refs/heads", FORMAT])?.lines() {
         let Some(b) = RawBranch::parse(line) else {
             continue;
         };
         // Never candidates: branches checked out in any worktree, the base
-        // itself, its local twin, anything tracking the base, protected names.
+        // itself, its local twin, protected names. (Merely TRACKING the base
+        // is not an exclusion: `git switch -c feat origin/main` sets exactly
+        // that upstream on perfectly ordinary feature branches.)
         if held.contains(&b.refname)
             || current.as_deref() == Some(b.name.as_str())
             || Some(&b.refname) == base.refname.as_ref()
             || Some(&b.refname) == base_local.as_ref()
-            || (b.upstream_ref.is_some() && b.upstream_ref == base.refname)
             || is_protected(&b.name, &protected)
         {
             continue;
@@ -123,7 +139,7 @@ pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) ->
                 None
             } else {
                 // One odd branch must not abort the whole scan.
-                match merged_by_patch_id(git, &base, &b.refname) {
+                match merged_by_patch_id(git, &base, &b.refname, &mut upstream_cache) {
                     Ok(kind) => kind,
                     Err(e) => {
                         warnings.push(format!("{}: merge probe failed: {e:#}", b.name));
@@ -172,10 +188,19 @@ fn resolve_base(git: &dyn Git, flag: Option<&str>) -> Result<Base> {
             bail!("--base {name} does not resolve to a commit");
         }
         let (ok, full) = git.try_run(&["rev-parse", "--symbolic-full-name", name])?;
-        let full = full.trim();
+        let mut full = full.trim().to_string();
+        // `--base origin/HEAD` (or plain `origin`) yields a symref; exclusion
+        // logic needs the branch it points at, or the local default branch
+        // would be left unprotected.
+        if ok
+            && !full.is_empty()
+            && let (true, target) = git.try_run(&["symbolic-ref", "--quiet", &full])?
+        {
+            full = target.trim().to_string();
+        }
         return Ok(Base {
             name: name.to_string(),
-            refname: (ok && !full.is_empty()).then(|| full.to_string()),
+            refname: (ok && !full.is_empty()).then_some(full),
         });
     }
     let (ok, out) = git.try_run(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])?;
@@ -267,7 +292,7 @@ fn protected_patterns(git: &dyn Git, extra: &[String]) -> Result<Vec<String>> {
                 .map(|p| p.trim().to_string()),
         );
     }
-    patterns.extend(extra.iter().cloned());
+    patterns.extend(extra.iter().map(|p| p.trim().to_string()));
     patterns.retain(|p| !p.is_empty());
     Ok(patterns)
 }
@@ -294,30 +319,69 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     rest.ends_with(parts[parts.len() - 1])
 }
 
+/// Diff rendering must be identical on both sides of a patch-id comparison,
+/// and immune to user config: `git log -p` is porcelain (honours
+/// diff.renames/algorithm/context/noprefix and color), `git diff-tree` is
+/// plumbing (honours none of them). Pin every knob on both.
+const DIFF_FLAGS: [&str; 9] = [
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--full-index",
+    "--diff-algorithm=myers",
+    "-U3",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+];
+
+fn with_diff_flags(prefix: &[&str], range: &str) -> Vec<String> {
+    prefix
+        .iter()
+        .map(|s| s.to_string())
+        .chain(DIFF_FLAGS.iter().map(|s| s.to_string()))
+        .chain(std::iter::once(range.to_string()))
+        .collect()
+}
+
 /// Patch-id detection for merges that rewrite history. Pure reads — no
 /// objects are written, so listing works on read-only repositories.
-fn merged_by_patch_id(git: &dyn Git, base: &Base, branch_ref: &str) -> Result<Option<MergeKind>> {
-    let (ok, merge_base) = git.try_run(&["merge-base", &base.name, branch_ref])?;
+/// `upstream_cache` memoizes the (expensive) upstream patch-id walk per
+/// merge-base: branches forked from the same point share one walk.
+fn merged_by_patch_id(
+    git: &dyn Git,
+    base: &Base,
+    branch_ref: &str,
+    upstream_cache: &mut HashMap<String, HashSet<String>>,
+) -> Result<Option<MergeKind>> {
+    let (ok, merge_base) = git.try_run(&["merge-base", base.rev(), branch_ref])?;
     if !ok {
         return Ok(None); // no common history
     }
     let merge_base = merge_base.trim().to_string();
 
     // Patches base gained since the fork point.
-    let upstream_log = git.run(&[
-        "log",
-        "-p",
-        "--no-merges",
-        &format!("{merge_base}..{}", base.name),
-    ])?;
-    let upstream_ids: HashSet<String> = patch_ids(git, &upstream_log)?.into_iter().collect();
+    if !upstream_cache.contains_key(&merge_base) {
+        let args = with_diff_flags(
+            &["log", "-p", "--no-merges"],
+            &format!("{merge_base}..{}", base.rev()),
+        );
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let ids = patch_ids(git, &git.run(&refs)?)?.into_iter().collect();
+        upstream_cache.insert(merge_base.clone(), ids);
+    }
+    let upstream_ids = &upstream_cache[&merge_base];
     if upstream_ids.is_empty() {
         return Ok(None);
     }
 
     // Squash: the whole branch collapsed into one diff — exactly what
     // GitHub's "Squash and merge" lands on base.
-    let combined = git.run(&["diff-tree", "-p", "-r", &merge_base, branch_ref])?;
+    let mut args = vec!["diff-tree".to_string(), "-p".to_string(), "-r".to_string()];
+    args.extend(DIFF_FLAGS.iter().map(|s| s.to_string()));
+    args.extend([merge_base.clone(), branch_ref.to_string()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let combined = git.run(&refs)?;
     if let Some(id) = patch_ids(git, &combined)?.first()
         && upstream_ids.contains(id)
     {
@@ -336,14 +400,29 @@ fn merged_by_patch_id(git: &dyn Git, base: &Base, branch_ref: &str) -> Result<Op
     if merges.trim() != "0" {
         return Ok(None);
     }
-    let branch_log = git.run(&[
-        "log",
-        "-p",
-        "--no-merges",
+    let args = with_diff_flags(
+        &["log", "-p", "--no-merges"],
         &format!("{merge_base}..{branch_ref}"),
-    ])?;
-    let branch_ids = patch_ids(git, &branch_log)?;
-    if !branch_ids.is_empty() && branch_ids.iter().all(|id| upstream_ids.contains(id)) {
+    );
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let branch_ids = patch_ids(git, &git.run(&refs)?)?;
+    // Empty-diff commits emit no patch-id at all; requiring the counts to
+    // match keeps a branch with e.g. an --allow-empty release marker from
+    // being classified (and force-deleted) as fully rebase-merged.
+    let commits: usize = git
+        .run(&[
+            "rev-list",
+            "--no-merges",
+            "--count",
+            &format!("{merge_base}..{branch_ref}"),
+        ])?
+        .trim()
+        .parse()
+        .unwrap_or(0);
+    if commits > 0
+        && branch_ids.len() == commits
+        && branch_ids.iter().all(|id| upstream_ids.contains(id))
+    {
         return Ok(Some(MergeKind::Rebase));
     }
     Ok(None)
@@ -415,10 +494,30 @@ mod tests {
             .on(
                 &["rev-parse", "--symbolic-full-name", "topic"],
                 Ok("refs/heads/topic\n"),
-            );
+            )
+            .on(&["symbolic-ref", "--quiet", "refs/heads/topic"], Err(""));
         let base = resolve_base(&git, Some("topic")).unwrap();
         assert_eq!(base.name, "topic");
         assert_eq!(base.refname.as_deref(), Some("refs/heads/topic"));
+        assert_eq!(base.rev(), "refs/heads/topic");
+
+        // --base origin/HEAD is a symref: it must deref to the real branch,
+        // or the local default branch would be left unprotected.
+        let git = FakeGit::default()
+            .on(
+                &["rev-parse", "--verify", "--quiet", "origin/HEAD^{commit}"],
+                Ok("abc\n"),
+            )
+            .on(
+                &["rev-parse", "--symbolic-full-name", "origin/HEAD"],
+                Ok("refs/remotes/origin/HEAD\n"),
+            )
+            .on(
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                Ok("refs/remotes/origin/trunk\n"),
+            );
+        let base = resolve_base(&git, Some("origin/HEAD")).unwrap();
+        assert_eq!(base.refname.as_deref(), Some("refs/remotes/origin/trunk"));
 
         // A raw SHA base has no refname but still works.
         let git = FakeGit::default()
@@ -585,13 +684,34 @@ mod tests {
         ]
         .join("\n");
 
-        let probe = |git: FakeGit, branch: &str, mb: &str, combined_id: &str, branch_ids: &str| {
+        // Argv builders mirroring the production DIFF_FLAGS plumbing.
+        fn log_args(range: &str) -> Vec<&str> {
+            let mut v = vec!["log", "-p", "--no-merges"];
+            v.extend_from_slice(&super::DIFF_FLAGS);
+            v.push(range);
+            v
+        }
+        fn diff_tree_args<'a>(mb: &'a str, branch_ref: &'a str) -> Vec<&'a str> {
+            let mut v = vec!["diff-tree", "-p", "-r"];
+            v.extend_from_slice(&super::DIFF_FLAGS);
+            v.extend([mb, branch_ref]);
+            v
+        }
+        const BASE_REV: &str = "refs/remotes/origin/main";
+
+        let probe = |git: FakeGit,
+                     branch: &str,
+                     mb: &str,
+                     combined_id: &str,
+                     branch_ids: &str,
+                     branch_commits: &str| {
+            let branch_ref = format!("refs/heads/{branch}");
             git.on(
-                &["merge-base", "origin/main", &format!("refs/heads/{branch}")],
+                &["merge-base", BASE_REV, &branch_ref],
                 Ok(&format!("{mb}\n")),
             )
             .on(
-                &["log", "-p", "--no-merges", &format!("{mb}..origin/main")],
+                &log_args(&format!("{mb}..{BASE_REV}")),
                 Ok(&format!("UPLOG-{mb}")),
             )
             .on_input(
@@ -600,7 +720,7 @@ mod tests {
                 Ok("up1 c1\nup2 c2\n"),
             )
             .on(
-                &["diff-tree", "-p", "-r", mb, &format!("refs/heads/{branch}")],
+                &diff_tree_args(mb, &branch_ref),
                 Ok(&format!("DIFF-{branch}")),
             )
             .on_input(
@@ -613,23 +733,27 @@ mod tests {
                     "rev-list",
                     "--min-parents=2",
                     "--count",
-                    &format!("{mb}..refs/heads/{branch}"),
+                    &format!("{mb}..{branch_ref}"),
                 ],
                 Ok("0\n"),
             )
             .on(
-                &[
-                    "log",
-                    "-p",
-                    "--no-merges",
-                    &format!("{mb}..refs/heads/{branch}"),
-                ],
+                &log_args(&format!("{mb}..{branch_ref}")),
                 Ok(&format!("BLOG-{branch}")),
             )
             .on_input(
                 &["patch-id", "--stable"],
                 &format!("BLOG-{branch}"),
                 Ok(branch_ids),
+            )
+            .on(
+                &[
+                    "rev-list",
+                    "--no-merges",
+                    "--count",
+                    &format!("{mb}..{branch_ref}"),
+                ],
+                Ok(branch_commits),
             )
         };
 
@@ -663,7 +787,7 @@ mod tests {
                     "for-each-ref",
                     "refs/heads",
                     "--merged",
-                    "origin/main",
+                    BASE_REV,
                     "--format=%(refname)",
                 ],
                 // feature-wt is merged but held by a worktree → must be excluded
@@ -674,11 +798,12 @@ mod tests {
                 Ok(&enumeration),
             );
         // squash: combined diff id matches upstream; rebase check not reached
-        git = probe(git, "feature-squash", "mb2", "up1", "irrelevant 0\n");
-        // rebase: combined misses, but each commit's id is upstream
-        git = probe(git, "feature-rebase", "mb3", "zzz", "up1 a\nup2 b\n");
+        git = probe(git, "feature-squash", "mb2", "up1", "irrelevant 0\n", "9");
+        // rebase: combined misses, but each commit's id is upstream and the
+        // id count equals the commit count (no empty commits hiding)
+        git = probe(git, "feature-rebase", "mb3", "zzz", "up1 a\nup2 b\n", "2\n");
         // gone: nothing matches
-        git = probe(git, "feature-gone", "mb4", "zzz", "own1 a\n");
+        git = probe(git, "feature-gone", "mb4", "zzz", "own1 a\n", "1\n");
 
         let scan = scan(&git, None, &["release/*".to_string()]).unwrap();
         assert_eq!(scan.base.name, "origin/main");
@@ -740,7 +865,7 @@ mod tests {
                     "for-each-ref",
                     "refs/heads",
                     "--merged",
-                    "origin/main",
+                    "refs/remotes/origin/main",
                     "--format=%(refname)",
                 ],
                 Ok(""),
@@ -750,12 +875,21 @@ mod tests {
                 Ok(&enumeration),
             )
             .on(
-                &["merge-base", "origin/main", "refs/heads/feature-odd"],
+                &[
+                    "merge-base",
+                    "refs/remotes/origin/main",
+                    "refs/heads/feature-odd",
+                ],
                 Ok("mb\n"),
             )
             // upstream log blows up (e.g. corrupt object) — scan must survive
             .on(
-                &["log", "-p", "--no-merges", "mb..origin/main"],
+                &{
+                    let mut v = vec!["log", "-p", "--no-merges"];
+                    v.extend_from_slice(&super::DIFF_FLAGS);
+                    v.push("mb..refs/remotes/origin/main");
+                    v
+                },
                 Err("boom"),
             );
 

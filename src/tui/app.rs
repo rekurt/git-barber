@@ -74,12 +74,10 @@ impl App {
     /// Pure state transition: no I/O, no terminal. Fully unit-testable.
     pub fn update(&mut self, key: KeyEvent) -> Option<Action> {
         // Raw mode swallows SIGINT, so honor Ctrl+C ourselves — everywhere.
-        // Every other modified key is dropped: Ctrl+N must not alias to the
-        // plain 'n' (deselect all) arm.
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
+        // Every other modified key (Ctrl/Alt/Super/…) is dropped: Ctrl+N must
+        // not alias to the plain 'n' (deselect all) arm. SHIFT stays allowed —
+        // crossterm reports 'G' as Char('G') + SHIFT.
+        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             {
@@ -145,7 +143,7 @@ impl App {
                 self.screen = Screen::Deleting;
                 Some(Action::Execute(self.planned()))
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => {
                 self.screen = Screen::List;
                 None
             }
@@ -263,7 +261,18 @@ mod tests {
         assert_eq!(app.selected_count(), 2, "Ctrl+N must not deselect");
         app.update(ctrl('a'));
         assert_eq!(app.selected_count(), 2, "Ctrl+A must not select all");
+        app.update(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+        assert_eq!(app.selected_count(), 2, "Cmd+A must not select all");
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn shift_g_still_jumps_to_bottom() {
+        // crossterm reports capital letters with the SHIFT modifier set; the
+        // modifier mask must not swallow them.
+        let mut app = app();
+        app.update(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(app.cursor, 2);
     }
 
     #[test]

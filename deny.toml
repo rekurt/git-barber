@@ -2,11 +2,9 @@
 # auditing ratatui's optional termwiz/termina backends (WTFPL terminfo,
 # Unicode-DFS wezterm-bidi) would fail the license check for code we never ship.
 [advisories]
-version = 2
 yanked = "deny"
 
 [licenses]
-version = 2
 allow = [
     "MIT",
     "Apache-2.0",

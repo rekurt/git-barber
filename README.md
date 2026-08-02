@@ -53,7 +53,8 @@ The base branch is `origin/HEAD` when set, then `origin/main`,
 
 `j`/`k`/arrows move · `g`/`G` top/bottom · `space` toggle · `a` all ·
 `n` none · `r` arm remote deletion for the highlighted branch ·
-`enter` confirm · `y` execute · `esc` back · `q`/`Ctrl+C` quit.
+`enter` confirm · in the dialog `y` executes, `n`/`q`/`esc` cancel ·
+`q`/`Ctrl+C` quit.
 On the results screen `j`/`k` scroll; the full report (with undo commands)
 is reprinted to the normal terminal after exit, so nothing is lost with the
 alternate screen. Deletions run synchronously; the title shows the branch
@@ -96,8 +97,9 @@ wildcards (`release/*`, `*-keep-*`).
   terminal, an editor's git integration) is refused with a "rescan" hint.
 - Merged branches use plain `git branch -d`. When git refuses only because
   it judges merged-ness against HEAD rather than the base, git-barber
-  re-verifies the ancestry itself and retries with `-D`, reporting
-  `force-deleted (verified merged)`.
+  re-verifies the ancestry itself and retries with `-D`. Every forced
+  deletion is labeled with its justification: `verified merged into base`,
+  `patch-id verified`, or `upstream was gone`.
 - Squash/rebase candidates are verified by patch-id and selected by default;
   **gone candidates never are** — they need a manual check in the TUI or an
   explicit `--include-gone`.
@@ -109,7 +111,8 @@ wildcards (`release/*`, `*-keep-*`).
 - Every deletion prints an undo command
   (`git branch <name> <sha>` / `git push origin <sha>:refs/heads/<name>`),
   and the report survives the TUI (reprinted after exit).
-- No network access unless you pass `--fetch`. Stale remote refs make
+- Scanning never touches the network unless you pass `--fetch` (remote
+  *deletion*, when you ask for it, obviously pushes). Stale remote refs make
   detection more conservative and make leased remote deletion refuse —
   never the other way around.
 
@@ -124,12 +127,14 @@ terminal in raw mode (`reset` fixes it).
 - `git branch --merged | xargs git branch -d` — misses squash and rebase
   merges, no confirmation step, no undo hints.
 - [git-trim](https://crates.io/crates/git-trim) — similar detection ideas,
-  more configuration surface, no TUI, libgit2-based; unmaintained since
-  late 2022.
+  more configuration surface, no TUI, libgit2-based; last released in 2022.
 
-git-barber shells out to your system `git` (like `gh` does), so hooks,
-config and credential helpers behave exactly as they do on your command
-line.
+git-barber shells out to your system `git` (like `gh` does), so hooks and
+config behave the way your git does. Two deliberate exceptions: repo-selecting
+environment variables (`GIT_DIR` & co) are cleared so `-C` always wins, and
+interactive credential prompts are disabled while the TUI owns the terminal —
+use `--fetch` (which may prompt) or a credential helper for remotes that
+need auth.
 
 ## Development
 

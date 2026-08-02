@@ -111,8 +111,14 @@ pub(crate) fn local_label(r: &ops::DeletionResult) -> String {
     }
 }
 
-pub fn human_execute(base: &str, results: &[ops::DeletionResult]) -> String {
-    let mut out = format!("base: {base}\n");
+pub fn human_execute(base: &str, warnings: &[String], results: &[ops::DeletionResult]) -> String {
+    let mut out = String::new();
+    // Warnings explain WHY branches may be missing (shallow repo, failed
+    // probes, failed fetch) — the execute path needs them as much as --list.
+    for w in warnings {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    out.push_str(&format!("base: {base}\n"));
     let name_w = results.iter().map(|r| r.name.len()).max().unwrap_or(0);
     for r in results {
         let local = local_label(r);
@@ -135,13 +141,14 @@ pub fn human_execute(base: &str, results: &[ops::DeletionResult]) -> String {
     out
 }
 
-/// The --yes --json report always carries the full candidate list, so
-/// scripts can tell "clean repo" from "gone branches awaiting consent".
+/// The --yes --json report always carries the full candidate list (same
+/// `branches` key as the listing, so scripts can share a parser) — a CI job
+/// must be able to tell "clean repo" from "gone branches awaiting consent".
 #[derive(Serialize)]
 struct ExecuteJson<'a> {
     base: &'a str,
     warnings: &'a [String],
-    candidates: Vec<BranchJson<'a>>,
+    branches: Vec<BranchJson<'a>>,
     results: &'a [ops::DeletionResult],
 }
 
@@ -149,7 +156,7 @@ pub fn json_execute(scan: &Scan, results: &[ops::DeletionResult]) -> Result<Stri
     Ok(serde_json::to_string_pretty(&ExecuteJson {
         base: &scan.base.name,
         warnings: &scan.warnings,
-        candidates: branches_json(scan),
+        branches: branches_json(scan),
         results,
     })?)
 }
@@ -241,10 +248,11 @@ mod tests {
         assert_eq!(value["branches"][0]["kind"], "rebase");
         assert_eq!(value["branches"][0]["selected_by_default"], true);
 
-        // --yes --json with nothing deleted still reports the candidates.
+        // --yes --json with nothing deleted still reports the candidates,
+        // under the same `branches` key as the listing.
         let value: serde_json::Value =
             serde_json::from_str(&json_execute(&scan, &[]).unwrap()).unwrap();
-        assert_eq!(value["candidates"][0]["name"], "a");
+        assert_eq!(value["branches"][0]["name"], "a");
         assert_eq!(value["results"].as_array().unwrap().len(), 0);
     }
 
@@ -264,7 +272,8 @@ mod tests {
                 "git push origin def456:refs/heads/shared".into(),
             ],
         }];
-        let text = human_execute("origin/main", &results);
+        let text = human_execute("origin/main", &["late fetch".to_string()], &results);
+        assert!(text.contains("warning: late fetch"), "{text}");
         assert!(text.contains("deleted origin/shared on remote"), "{text}");
         assert!(text.contains("undo:"));
         assert!(text.contains("git reflog"));

@@ -97,7 +97,11 @@ fn render_list(frame: &mut Frame, app: &mut App) {
         app.items.len()
     ));
     if let Some(w) = app.warnings.first() {
-        block = block.title_bottom(Line::styled(format!(" ! {w} "), YELLOW));
+        let more = match app.warnings.len() {
+            0 | 1 => String::new(),
+            n => format!(" (+{} more)", n - 1),
+        };
+        block = block.title_bottom(Line::styled(format!(" ! {w}{more} "), YELLOW));
     }
     let list = List::new(items)
         .block(block)
@@ -125,8 +129,14 @@ fn render_confirm(frame: &mut Frame, app: &App) {
         .iter()
         .filter(|i| i.selected && i.remote)
         .filter_map(|i| {
-            ops::remote_branch(&i.candidate)
-                .map(|(r, b)| format!("  {} → deletes {r}/{b}", i.candidate.name))
+            // Target first: if the terminal is narrow, the ref actually being
+            // deleted must survive, not the local nickname.
+            ops::remote_branch(&i.candidate).map(|(r, b)| {
+                format!(
+                    "  deletes {r}/{b}  (local: {})",
+                    clip(&i.candidate.name, MAX_NAME_W)
+                )
+            })
         })
         .collect();
     if !remote.is_empty() {
@@ -378,7 +388,7 @@ mod tests {
         let remote_pos = text.find("DELETE ON REMOTE").expect("remote section");
         let gentle_pos = text.find("git branch -d").expect("gentle section");
         assert!(remote_pos < gentle_pos, "remote section must render first");
-        assert!(text.contains("merged-a → deletes origin/merged-a"));
+        assert!(text.contains("deletes origin/merged-a"));
     }
 
     #[test]

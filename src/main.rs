@@ -80,7 +80,10 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
             if cli.json {
                 println!("{}", output::json_execute(&scan, &results)?);
             } else {
-                print!("{}", output::human_execute(&scan.base.name, &results));
+                print!(
+                    "{}",
+                    output::human_execute(&scan.base.name, &scan.warnings, &results)
+                );
             }
             Ok(if results.iter().any(ops::DeletionResult::failed) {
                 ExitCode::from(1)

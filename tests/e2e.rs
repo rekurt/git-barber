@@ -357,6 +357,97 @@ fn list_conflicts_with_yes() {
 }
 
 #[test]
+fn rebase_with_extra_empty_commit_is_not_classified() {
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "a.txt", "one", "real work 1");
+    commit_file(&dir, "b.txt", "two", "real work 2");
+    git(&dir, &["commit", "--allow-empty", "-m", "release marker"]);
+    git(&dir, &["checkout", "main"]);
+    // Only the real commits are replayed upstream; the empty marker is not.
+    // (Two of them, so the combined squash diff matches no single patch.)
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(&dir)
+        .args(["cherry-pick", "feature~2", "feature~1"])
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@localhost")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@localhost")
+        .env("GIT_COMMITTER_DATE", "2030-01-01T00:00:00Z");
+    hermetic(&mut cmd, &dir);
+    assert!(cmd.status().unwrap().success());
+
+    // Empty-diff commits emit no patch-id; without the count guard the
+    // branch would read as fully rebase-merged and be force-deleted along
+    // with its (not-upstream) release-marker commit.
+    let json = list_json(&dir);
+    assert!(
+        branch_kinds(&json).is_empty(),
+        "empty commit must block the rebase verdict: {json}"
+    );
+    barber(&dir).arg("--yes").assert().success();
+    git(&dir, &["rev-parse", "--verify", "feature"]);
+}
+
+#[test]
+fn squash_with_rename_is_detected_despite_diff_config() {
+    let (_tmp, dir) = repo();
+    // Hostile-but-common user config: porcelain diffs would render renames
+    // and use a different algorithm; detection must be immune.
+    git(&dir, &["config", "diff.renames", "true"]);
+    git(&dir, &["config", "diff.algorithm", "histogram"]);
+    git(&dir, &["config", "diff.context", "5"]);
+
+    git(&dir, &["checkout", "-b", "refactor"]);
+    git(&dir, &["mv", "README.md", "GUIDE.md"]);
+    commit_file(&dir, "extra.txt", "x", "move readme and add extra");
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--squash", "refactor"]);
+    git(&dir, &["commit", "-m", "refactor (squashed)"]);
+
+    assert_eq!(
+        branch_kinds(&list_json(&dir)),
+        vec![("refactor".into(), "squash".into())]
+    );
+}
+
+#[test]
+fn leased_remote_delete_refuses_when_remote_moved() {
+    let (_tmp, origin, dir) = repo_with_origin();
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "f.txt", "f", "feature work");
+    git(&dir, &["push", "-u", "origin", "feature"]);
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--no-ff", "feature", "-m", "merge"]);
+    git(&dir, &["push", "origin", "main"]);
+
+    // A colleague pushes to the branch AFTER our last fetch.
+    let colleague = dir.parent().unwrap().join("colleague");
+    git(
+        dir.parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            origin.to_str().unwrap(),
+            colleague.to_str().unwrap(),
+        ],
+    );
+    git(&colleague, &["checkout", "feature"]);
+    commit_file(&colleague, "late.txt", "late", "late work");
+    git(&colleague, &["push", "origin", "feature"]);
+
+    // Local deletion succeeds; the leased remote deletion must refuse and
+    // the remote branch (with the colleague's commit) must survive.
+    barber(&dir).args(["--yes", "--remote"]).assert().code(1);
+    let remote_branches = git(&origin, &["branch", "--format=%(refname:short)"]);
+    assert!(
+        remote_branches.lines().any(|b| b == "feature"),
+        "lease must protect the moved remote branch: {remote_branches}"
+    );
+}
+
+#[test]
 fn yes_json_reports_candidates_even_when_nothing_is_deleted() {
     let (_tmp, origin, dir) = repo_with_origin();
     git(&dir, &["checkout", "-b", "gone-one"]);
@@ -368,8 +459,8 @@ fn yes_json_reports_candidates_even_when_nothing_is_deleted() {
 
     let out = barber(&dir).args(["--yes", "--json"]).assert().success();
     let json: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(json["candidates"][0]["name"], "gone-one", "{json}");
-    assert_eq!(json["candidates"][0]["kind"], "gone");
+    assert_eq!(json["branches"][0]["name"], "gone-one", "{json}");
+    assert_eq!(json["branches"][0]["kind"], "gone");
     assert_eq!(json["results"].as_array().unwrap().len(), 0);
 }
 
