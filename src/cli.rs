@@ -28,7 +28,8 @@ pub struct Cli {
 
     /// Also delete the remote counterpart of each deleted branch (destructive:
     /// affects everyone using the remote). In the TUI this pre-arms the `r`
-    /// toggle on every candidate with a live upstream
+    /// toggle on local candidates with a live upstream. Remote-only merged
+    /// branches are always shown and still need manual selection.
     #[arg(long)]
     pub remote: bool,
 

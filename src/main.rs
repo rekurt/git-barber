@@ -12,6 +12,7 @@ use clap::Parser;
 
 use crate::cli::{Cli, Mode};
 use crate::git::{Git, SystemGit};
+use crate::scan::CandidateScope;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -40,7 +41,9 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
         fetch_warning = Some(warning);
     }
 
-    let mut scan = scan::scan(&git, cli.base.as_deref(), &cli.protect)?;
+    // Remote-only candidates are always informational and start unchecked in
+    // the TUI; `--remote` only pre-arms remote deletion for local candidates.
+    let mut scan = scan::scan_with_remote(&git, cli.base.as_deref(), &cli.protect, true)?;
     scan.warnings.extend(fetch_warning);
 
     match cli.mode() {
@@ -57,7 +60,9 @@ fn run(cli: &Cli) -> anyhow::Result<ExitCode> {
                 .candidates
                 .iter()
                 .filter(|c| {
-                    c.selected_by_default() || (cli.include_gone && c.kind == scan::MergeKind::Gone)
+                    c.scope != CandidateScope::RemoteOnly
+                        && (c.selected_by_default()
+                            || (cli.include_gone && c.kind == scan::MergeKind::Gone))
                 })
                 .map(|c| ops::PlannedDeletion {
                     candidate: c.clone(),

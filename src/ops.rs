@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::git::Git;
-use crate::scan::{Base, Candidate};
+use crate::scan::{Base, Candidate, CandidateScope};
 
 pub struct PlannedDeletion {
     pub candidate: Candidate,
@@ -11,6 +11,8 @@ pub struct PlannedDeletion {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "status", content = "detail")]
 pub enum LocalOutcome {
+    /// The plan intentionally targets a remote branch without a local twin.
+    Skipped,
     Deleted,
     /// `-D` was needed; we only force after verifying the merge ourselves.
     ForceDeleted,
@@ -71,7 +73,9 @@ pub fn delete_one(
     let mut undo = Vec::new();
 
     // Invariants scan.rs already enforces, re-asserted before destruction.
-    let local = if Some(c.name.as_str()) == current {
+    let local = if c.scope == CandidateScope::RemoteOnly {
+        LocalOutcome::Skipped
+    } else if Some(c.name.as_str()) == current {
         LocalOutcome::Failed("refusing to delete the checked-out branch".to_string())
     } else if c.name == base.name || Some(&c.refname) == base.refname.as_ref() {
         LocalOutcome::Failed("refusing to delete the base branch".to_string())
@@ -197,11 +201,14 @@ pub fn remote_branch(c: &Candidate) -> Option<(String, String)> {
         return None;
     }
     let remote = c.remote_name.clone()?;
-    let branch = c
-        .upstream
-        .as_ref()?
-        .strip_prefix(&format!("{remote}/"))?
-        .to_string();
+    let branch = if c.scope == CandidateScope::RemoteOnly {
+        c.name.strip_prefix(&format!("{remote}/"))?.to_string()
+    } else {
+        c.upstream
+            .as_ref()?
+            .strip_prefix(&format!("{remote}/"))?
+            .to_string()
+    };
     Some((remote, branch))
 }
 
@@ -237,6 +244,7 @@ mod tests {
             refname: format!("refs/heads/{name}"),
             sha: SHA.into(),
             kind,
+            scope: CandidateScope::Local,
             upstream: Some(format!("origin/{name}")),
             remote_name: Some("origin".into()),
             upstream_gone: kind == MergeKind::Gone,

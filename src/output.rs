@@ -97,6 +97,7 @@ pub fn json_list(scan: &Scan) -> Result<String> {
 /// force was justified (a gone branch is consented-to, not verified).
 pub(crate) fn local_label(r: &ops::DeletionResult) -> String {
     match (&r.local, r.kind) {
+        (ops::LocalOutcome::Skipped, _) => "remote only".to_string(),
         (ops::LocalOutcome::Deleted, _) => "deleted".to_string(),
         (ops::LocalOutcome::ForceDeleted, MergeKind::Merged) => {
             "force-deleted (verified merged into base)".to_string()
@@ -203,6 +204,7 @@ mod tests {
             refname: format!("refs/heads/{name}"),
             sha: "abc123".into(),
             kind,
+            scope: crate::scan::CandidateScope::Local,
             upstream: Some(format!("origin/{name}")),
             remote_name: Some("origin".into()),
             upstream_gone: kind == MergeKind::Gone,

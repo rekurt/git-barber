@@ -21,6 +21,16 @@ pub enum MergeKind {
     Gone,
 }
 
+/// Where a deletion candidate lives. Remote-only candidates are acted on
+/// exclusively through the TUI confirmation: `--yes --remote` must not turn
+/// into a broad remote-pruning command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateScope {
+    Local,
+    RemoteOnly,
+}
+
 /// The branch everything is compared against.
 #[derive(Debug, Clone)]
 pub struct Base {
@@ -49,6 +59,7 @@ pub struct Candidate {
     /// Tip OID at scan time; deletion re-verifies against it (undo anchor).
     pub sha: String,
     pub kind: MergeKind,
+    pub scope: CandidateScope,
     pub upstream: Option<String>,
     pub remote_name: Option<String>,
     pub upstream_gone: bool,
@@ -81,7 +92,17 @@ const FORMAT: &str = "--format=%(refname)%00%(objectname)%00%(upstream)%00%(upst
 
 pub const DEFAULT_PROTECTED: [&str; 3] = ["main", "master", "develop"];
 
-pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) -> Result<Scan> {
+#[cfg(test)]
+fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) -> Result<Scan> {
+    scan_with_remote(git, base_flag, extra_protect, false)
+}
+
+pub fn scan_with_remote(
+    git: &dyn Git,
+    base_flag: Option<&str>,
+    extra_protect: &[String],
+    include_remote_only: bool,
+) -> Result<Scan> {
     let base = resolve_base(git, base_flag)?;
     let current = current_branch(git)?;
     let protected = protected_patterns(git, extra_protect)?;
@@ -159,6 +180,7 @@ pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) ->
             refname: b.refname,
             sha: b.sha,
             kind,
+            scope: CandidateScope::Local,
             upstream: b.upstream,
             remote_name: b.remote_name,
             upstream_gone: b.upstream_gone,
@@ -168,7 +190,87 @@ pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) ->
         });
     }
 
-    candidates.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+    if include_remote_only {
+        let local_names: HashSet<String> = git
+            .run(&["for-each-ref", "refs/heads", "--format=%(refname:short)"])?
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let remote_merged: HashSet<String> = git
+            .run(&[
+                "for-each-ref",
+                "refs/remotes",
+                "--merged",
+                base.rev(),
+                "--format=%(refname)",
+            ])?
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let remote_format =
+            "--format=%(refname)%00%(objectname)%00%(committerdate:unix)%00%(contents:subject)";
+        for line in git
+            .run(&["for-each-ref", "refs/remotes", remote_format])?
+            .lines()
+        {
+            let mut fields = line.split('\0');
+            let (Some(refname), Some(sha), Some(age), Some(subject)) =
+                (fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let Some(rest) = refname.strip_prefix("refs/remotes/") else {
+                continue;
+            };
+            let Some((remote, branch)) = rest.split_once('/') else {
+                continue;
+            };
+            // `origin/HEAD` is a symref, and the base, protected names, and
+            // any branch that still has a local counterpart belong to the
+            // normal local-candidate flow instead.
+            if branch == "HEAD"
+                || Some(refname) == base.refname.as_deref()
+                || is_protected(branch, &protected)
+                || local_names.contains(branch)
+            {
+                continue;
+            }
+            let kind = if remote_merged.contains(refname) {
+                MergeKind::Merged
+            } else if shallow {
+                continue;
+            } else {
+                match merged_by_patch_id(git, &base, refname, &mut upstream_cache) {
+                    Ok(Some(kind)) => kind,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warnings.push(format!("{remote}/{branch}: merge probe failed: {e:#}"));
+                        continue;
+                    }
+                }
+            };
+            candidates.push(Candidate {
+                name: format!("{remote}/{branch}"),
+                refname: refname.to_string(),
+                sha: sha.to_string(),
+                kind,
+                scope: CandidateScope::RemoteOnly,
+                upstream: Some(format!("{remote}/{branch}")),
+                remote_name: Some(remote.to_string()),
+                upstream_gone: false,
+                last_commit_unix: age.parse().unwrap_or(0),
+                subject: subject.to_string(),
+                upstream_ref: Some(refname.to_string()),
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        a.scope
+            .cmp(&b.scope)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.name.cmp(&b.name))
+    });
     Ok(Scan {
         base,
         candidates,
