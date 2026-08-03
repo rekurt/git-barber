@@ -25,6 +25,16 @@ pub enum MergeKind {
     Gone,
 }
 
+/// Where a deletion candidate lives. Remote-only candidates are acted on
+/// exclusively through the TUI confirmation: `--yes --remote` must not turn
+/// into a broad remote-pruning command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateScope {
+    Local,
+    RemoteOnly,
+}
+
 /// The branch everything is compared against.
 #[derive(Debug, Clone)]
 pub struct Base {
@@ -57,6 +67,7 @@ pub struct Candidate {
     /// Tip OID at scan time; deletion re-verifies against it (undo anchor).
     pub sha: String,
     pub kind: MergeKind,
+    pub scope: CandidateScope,
     pub upstream: Option<String>,
     pub remote_name: Option<String>,
     pub upstream_gone: bool,
@@ -98,6 +109,10 @@ pub struct Options<'a> {
     pub protect: &'a [String],
     /// Scan worker threads.
     pub jobs: usize,
+    /// Also scan remote branches that are merged into the base but have no
+    /// local twin. Off by default so library-style callers and tests get the
+    /// plain local scan.
+    pub include_remote_only: bool,
 }
 
 pub fn scan(
@@ -128,17 +143,12 @@ pub fn scan(
     // mid-scan would otherwise judge early branches against one base tip and
     // later ones against another — and, worse, cache a verdict under a key
     // naming a base it was not computed against.
-    let merged: HashSet<String> = git
-        .run(&[
-            "for-each-ref",
-            "refs/heads",
-            "--merged",
-            &base.sha,
-            "--format=%(refname)",
-        ])?
-        .lines()
-        .map(str::to_string)
-        .collect();
+    let mut merged_args = vec!["for-each-ref", "refs/heads"];
+    if opts.include_remote_only {
+        merged_args.push("refs/remotes");
+    }
+    merged_args.extend(["--merged", &base.sha, "--format=%(refname)"]);
+    let merged: HashSet<String> = git.run(&merged_args)?.lines().map(str::to_string).collect();
 
     // The local twin of a remote base: base `origin/main` → `refs/heads/main`.
     let base_local = base_local_counterpart(git, &base)?;
@@ -152,7 +162,7 @@ pub fn scan(
     // its local twin, protected names. (Merely TRACKING the base is not an
     // exclusion: `git switch -c feat origin/main` sets exactly that upstream
     // on perfectly ordinary feature branches.)
-    let examinable: Vec<RawBranch> = branches
+    let mut examinable: Vec<RawBranch> = branches
         .into_iter()
         .filter(|b| {
             !(held.contains(&b.refname)
@@ -162,6 +172,36 @@ pub fn scan(
                 || is_protected(&b.name, &protected))
         })
         .collect();
+
+    // Remote branches merged into the base whose local twin is already gone.
+    // They join `examinable` rather than getting a probe loop of their own, so
+    // they share the same cache, the same parallel walk, and the same progress
+    // total as everything else.
+    if opts.include_remote_only {
+        // Every local branch, not just the examinable ones: a remote whose
+        // twin is merely protected or checked out is not "remote-only".
+        let all_local: HashSet<String> = git
+            .run(&["for-each-ref", "refs/heads", "--format=%(refname:short)"])?
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let raw_remote = git.run(&["for-each-ref", "refs/remotes", FORMAT])?;
+        examinable.extend(
+            raw_remote
+                .lines()
+                .filter_map(RawBranch::parse_remote)
+                .filter(|b| {
+                    // `origin/HEAD` is a symref onto the default branch, the base
+                    // itself is never a candidate, and anything that still has a
+                    // local branch belongs to the normal local flow above.
+                    !(b.short_remote_name() == "HEAD"
+                        || Some(&b.refname) == base.refname.as_ref()
+                        || is_protected(b.short_remote_name(), &protected)
+                        || is_protected(&b.name, &protected)
+                        || all_local.contains(b.short_remote_name()))
+                }),
+        );
+    }
 
     let total = examinable.len();
     let done = AtomicUsize::new(0);
@@ -296,6 +336,7 @@ pub fn scan(
             refname: b.refname.clone(),
             sha: b.sha.clone(),
             kind,
+            scope: b.scope,
             upstream: b.upstream.clone(),
             remote_name: b.remote_name.clone(),
             upstream_gone: b.upstream_gone,
@@ -306,7 +347,12 @@ pub fn scan(
     }
 
     reporter.finish();
-    candidates.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
+    candidates.sort_by(|a, b| {
+        a.scope
+            .cmp(&b.scope)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.name.cmp(&b.name))
+    });
     Ok(Scan {
         base,
         candidates,
@@ -591,6 +637,7 @@ struct RawBranch {
     name: String,
     refname: String,
     sha: String,
+    scope: CandidateScope,
     upstream: Option<String>,
     upstream_ref: Option<String>,
     remote_name: Option<String>,
@@ -616,6 +663,7 @@ impl RawBranch {
             name,
             refname,
             sha,
+            scope: CandidateScope::Local,
             upstream: (!upstream.is_empty()).then(|| upstream.to_string()),
             upstream_ref: (!upstream_ref.is_empty()).then(|| upstream_ref.to_string()),
             remote_name: (!remote_name.is_empty()).then(|| remote_name.to_string()),
@@ -623,6 +671,44 @@ impl RawBranch {
             last_commit_unix,
             subject,
         })
+    }
+
+    /// The same `for-each-ref` line, read as a remote-tracking ref. A remote
+    /// ref has no upstream of its own, so the fields that describe one are
+    /// synthesised to point at the ref itself: that is what `ops::remote_branch`
+    /// and the confirmation dialog need in order to name the deletion target.
+    fn parse_remote(line: &str) -> Option<Self> {
+        let mut f = line.split('\0');
+        let refname = f.next()?.to_string();
+        let name = refname.strip_prefix("refs/remotes/")?.to_string();
+        // A bare "refs/remotes/origin" (no branch part) is not a branch.
+        let remote = name.split_once('/')?.0.to_string();
+        let sha = f.next()?.to_string();
+        // upstream, upstream:short, upstream:track and upstream:remotename
+        // are all empty for a remote-tracking ref; step past them.
+        for _ in 0..4 {
+            f.next()?;
+        }
+        let last_commit_unix = f.next()?.parse().ok()?;
+        let subject = f.next().unwrap_or_default().to_string();
+        Some(Self {
+            name: name.clone(),
+            refname: refname.clone(),
+            sha,
+            scope: CandidateScope::RemoteOnly,
+            upstream: Some(name),
+            upstream_ref: Some(refname),
+            remote_name: Some(remote),
+            upstream_gone: false,
+            last_commit_unix,
+            subject,
+        })
+    }
+
+    /// For a remote-tracking ref, the branch name on the remote
+    /// ("origin/feat" → "feat"). Meaningless for a local branch.
+    fn short_remote_name(&self) -> &str {
+        self.name.split_once('/').map_or(&self.name, |(_, b)| b)
     }
 }
 
@@ -741,6 +827,7 @@ mod tests {
             base: None,
             protect: &[],
             jobs: 1,
+            include_remote_only: false,
         }
     }
 
@@ -898,6 +985,7 @@ mod tests {
                 base: None,
                 protect: &[],
                 jobs: 1,
+                include_remote_only: false,
             },
             &crate::progress::NullReporter,
             &mut Cache::default(),
@@ -968,6 +1056,7 @@ mod tests {
                 base: None,
                 protect: &[],
                 jobs: 1,
+                include_remote_only: false,
             },
             &reporter,
             &mut Cache::default(),
@@ -1000,6 +1089,7 @@ mod tests {
                 base: None,
                 protect: &[],
                 jobs: 1,
+                include_remote_only: false,
             },
             &reporter,
             &mut Cache::default(),
@@ -1347,6 +1437,7 @@ mod tests {
                 base: None,
                 protect: &["release/*".to_string()],
                 jobs: 1,
+                include_remote_only: false,
             },
             &crate::progress::NullReporter,
             &mut Cache::default(),
@@ -1440,6 +1531,7 @@ mod tests {
                 base: None,
                 protect: &[],
                 jobs: 1,
+                include_remote_only: false,
             },
             &crate::progress::NullReporter,
             &mut Cache::default(),

@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::ops::{self, LocalOutcome, RemoteOutcome};
 use crate::output::kind_label;
-use crate::scan::MergeKind;
+use crate::scan::{CandidateScope, MergeKind};
 use crate::tui::app::{App, Screen};
 
 const MAX_NAME_W: usize = 40;
@@ -96,46 +96,69 @@ fn render_list(frame: &mut Frame, app: &mut App) {
         .max()
         .unwrap_or(0)
         .min(MAX_NAME_W);
-    let items: Vec<ListItem> = app
+    let row = |item: &crate::tui::app::Item| {
+        let c = &item.candidate;
+        // The remote-delete marker sits in a fixed column right after the
+        // checkbox: destructive state must never be truncated away.
+        let remote_marker = if item.remote {
+            Span::styled("r:[x] ", RED)
+        } else if item.can_remote() {
+            Span::styled("r:[ ] ", DIM)
+        } else {
+            Span::raw("      ")
+        };
+        let mut spans = vec![
+            Span::raw(if item.selected { "[x] " } else { "[ ] " }),
+            remote_marker,
+            Span::raw(format!("{:name_w$}  ", clip(&c.name, MAX_NAME_W))),
+            Span::styled(
+                if c.scope == CandidateScope::RemoteOnly {
+                    "remote".to_string()
+                } else {
+                    format!("{:6}", kind_label(c.kind))
+                },
+                if c.scope == CandidateScope::RemoteOnly {
+                    RED
+                } else {
+                    kind_style(c.kind)
+                },
+            ),
+            Span::styled(
+                format!(
+                    "  {:>4} ago",
+                    crate::output::age(app.now_unix, c.last_commit_unix)
+                ),
+                DIM,
+            ),
+        ];
+        match (&c.upstream, c.upstream_gone) {
+            (Some(u), true) => spans.push(Span::styled(format!("  ↑ {u} (gone)"), DIM)),
+            (Some(u), false) => spans.push(Span::styled(format!("  ↑ {u}"), DIM)),
+            (None, _) => {}
+        }
+        ListItem::new(Line::from(spans))
+    };
+    // Remote-only candidates are deliberately a distinct section: they have
+    // no local branch to remove, so their selection means a remote deletion.
+    let local_count = app
         .items
         .iter()
-        .map(|item| {
-            let c = &item.candidate;
-            // The remote-delete marker sits in a fixed column right after the
-            // checkbox: destructive state must never be truncated away.
-            let remote_marker = if item.remote {
-                Span::styled("r:[x] ", RED)
-            } else if item.can_remote() {
-                Span::styled("r:[ ] ", DIM)
-            } else {
-                Span::raw("      ")
-            };
-            let mut spans = vec![
-                Span::raw(if item.selected { "[x] " } else { "[ ] " }),
-                remote_marker,
-                Span::raw(format!("{:name_w$}  ", clip(&c.name, MAX_NAME_W))),
-                Span::styled(format!("{:6}", kind_label(c.kind)), kind_style(c.kind)),
-                Span::styled(
-                    format!(
-                        "  {:>4} ago",
-                        crate::output::age(app.now_unix, c.last_commit_unix)
-                    ),
-                    DIM,
-                ),
-            ];
-            match (&c.upstream, c.upstream_gone) {
-                (Some(u), true) => spans.push(Span::styled(format!("  ↑ {u} (gone)"), DIM)),
-                (Some(u), false) => spans.push(Span::styled(format!("  ↑ {u}"), DIM)),
-                (None, _) => {}
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
+        .take_while(|i| i.candidate.scope == CandidateScope::Local)
+        .count();
+    let mut items: Vec<ListItem> = app.items[..local_count].iter().map(row).collect();
+    if local_count < app.items.len() {
+        items.push(ListItem::new(Line::styled(
+            " REMOTE-ONLY — merged, no local twin; Enter then y/n to delete ",
+            RED.add_modifier(Modifier::BOLD),
+        )));
+        items.extend(app.items[local_count..].iter().map(row));
+    }
 
     let mut block = Block::bordered().title(format!(
-        " git barber · base {} · {} candidates ",
+        " git barber · base {} · {} candidates · {} remote-only ",
         app.base.name,
-        app.items.len()
+        app.items.len(),
+        app.remote_only_count()
     ));
     if let Some(w) = app.warnings.first() {
         let more = match app.warnings.len() {
@@ -148,7 +171,9 @@ fn render_list(frame: &mut Frame, app: &mut App) {
         .block(block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▸ ");
-    app.list_state.select(Some(app.cursor));
+    let display_cursor =
+        app.cursor + usize::from(local_count < app.items.len() && app.cursor >= local_count);
+    app.list_state.select(Some(display_cursor));
     frame.render_stateful_widget(list, main, &mut app.list_state);
 
     if let Some(area) = preview {
@@ -177,10 +202,14 @@ fn render_confirm(frame: &mut Frame, app: &App) {
             // Target first: if the terminal is narrow, the ref actually being
             // deleted must survive, not the local nickname.
             ops::remote_branch(&i.candidate).map(|(r, b)| {
-                format!(
-                    "  deletes {r}/{b}  (local: {})",
-                    clip(&i.candidate.name, MAX_NAME_W)
-                )
+                if i.candidate.scope == CandidateScope::RemoteOnly {
+                    format!("  deletes {r}/{b}  (remote-only)")
+                } else {
+                    format!(
+                        "  deletes {r}/{b}  (local: {})",
+                        clip(&i.candidate.name, MAX_NAME_W)
+                    )
+                }
             })
         })
         .collect();
@@ -195,7 +224,11 @@ fn render_confirm(frame: &mut Frame, app: &App) {
     let gone: Vec<&str> = app
         .items
         .iter()
-        .filter(|i| i.selected && i.candidate.kind == MergeKind::Gone)
+        .filter(|i| {
+            i.selected
+                && i.candidate.scope == CandidateScope::Local
+                && i.candidate.kind == MergeKind::Gone
+        })
         .map(|i| i.candidate.name.as_str())
         .collect();
     if !gone.is_empty() {
@@ -209,7 +242,12 @@ fn render_confirm(frame: &mut Frame, app: &App) {
     let force: Vec<&str> = app
         .items
         .iter()
-        .filter(|i| i.selected && i.candidate.needs_force() && i.candidate.kind != MergeKind::Gone)
+        .filter(|i| {
+            i.selected
+                && i.candidate.scope == CandidateScope::Local
+                && i.candidate.needs_force()
+                && i.candidate.kind != MergeKind::Gone
+        })
         .map(|i| i.candidate.name.as_str())
         .collect();
     if !force.is_empty() {
@@ -223,7 +261,9 @@ fn render_confirm(frame: &mut Frame, app: &App) {
     let gentle: Vec<&str> = app
         .items
         .iter()
-        .filter(|i| i.selected && !i.candidate.needs_force())
+        .filter(|i| {
+            i.selected && i.candidate.scope == CandidateScope::Local && !i.candidate.needs_force()
+        })
         .map(|i| i.candidate.name.as_str())
         .collect();
     if !gentle.is_empty() {
@@ -368,6 +408,7 @@ mod tests {
             refname: format!("refs/heads/{name}"),
             sha: "0123456789abcdef0123".into(),
             kind,
+            scope: CandidateScope::Local,
             upstream: Some(format!("origin/{name}")),
             remote_name: Some("origin".into()),
             upstream_gone: kind == MergeKind::Gone,
@@ -421,6 +462,66 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?}");
         }
+    }
+
+    fn remote_only_candidate(name: &str) -> Candidate {
+        let mut c = candidate(name, MergeKind::Merged);
+        c.scope = CandidateScope::RemoteOnly;
+        c.name = format!("origin/{name}");
+        c.refname = format!("refs/remotes/origin/{name}");
+        c
+    }
+
+    fn mixed_app() -> App {
+        let scan = Scan {
+            base: Base {
+                name: "origin/main".into(),
+                refname: Some("refs/remotes/origin/main".into()),
+                sha: "base000".into(),
+            },
+            candidates: vec![
+                candidate("merged-a", MergeKind::Merged),
+                remote_only_candidate("orphan"),
+            ],
+            warnings: vec![],
+        };
+        App::new(scan, false, 86_400, false)
+    }
+
+    #[test]
+    fn remote_only_candidates_render_under_their_own_heading() {
+        let mut app = mixed_app();
+        let text = screen_text(&mut app);
+        for needle in ["REMOTE-ONLY", "origin/orphan", "1 remote-only"] {
+            assert!(text.contains(needle), "missing {needle:?}");
+        }
+        // The section heading is a row of its own, so the highlight has to be
+        // pushed past it or it lands on the wrong branch.
+        let heading = text.find("REMOTE-ONLY").expect("heading");
+        let orphan = text.find("origin/orphan").expect("row");
+        assert!(heading < orphan, "heading must precede its section");
+    }
+
+    #[test]
+    fn the_highlight_skips_the_remote_only_heading() {
+        let mut app = mixed_app();
+        app.update(KeyEvent::from(KeyCode::Char('j'))); // onto the remote-only row
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let highlighted: Vec<String> = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(100)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .filter(|row| row.contains("▸ "))
+            .collect();
+        assert_eq!(highlighted.len(), 1, "exactly one highlighted row");
+        assert!(
+            highlighted[0].contains("origin/orphan"),
+            "highlight landed on {:?}",
+            highlighted[0]
+        );
     }
 
     #[test]

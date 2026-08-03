@@ -4,7 +4,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 
 use crate::ops::{self, DeletionResult, PlannedDeletion};
-use crate::scan::{Base, Candidate, Scan};
+use crate::scan::{Base, Candidate, CandidateScope, Scan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -60,7 +60,8 @@ impl App {
             .into_iter()
             .map(|c| Item {
                 selected: c.selected_by_default(),
-                remote: preselect_remote && ops::remote_branch(&c).is_some(),
+                remote: (c.scope == CandidateScope::RemoteOnly || preselect_remote)
+                    && ops::remote_branch(&c).is_some(),
                 candidate: c,
             })
             .collect();
@@ -229,6 +230,13 @@ impl App {
         self.items.iter().filter(|i| i.selected && i.remote).count()
     }
 
+    pub fn remote_only_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| i.candidate.scope == CandidateScope::RemoteOnly)
+            .count()
+    }
+
     pub fn any_failed(&self) -> bool {
         self.results.iter().any(DeletionResult::failed)
     }
@@ -253,6 +261,7 @@ mod tests {
             refname: format!("refs/heads/{name}"),
             sha: "0123456789abcdef0123".into(),
             kind,
+            scope: CandidateScope::Local,
             upstream: (kind != MergeKind::Gone).then(|| format!("origin/{name}")),
             remote_name: Some("origin".into()),
             upstream_gone: kind == MergeKind::Gone,

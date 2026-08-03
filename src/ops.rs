@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::git::Git;
-use crate::scan::{Base, Candidate};
+use crate::scan::{Base, Candidate, CandidateScope};
 
 pub struct PlannedDeletion {
     pub candidate: Candidate,
@@ -11,6 +11,8 @@ pub struct PlannedDeletion {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "status", content = "detail")]
 pub enum LocalOutcome {
+    /// The plan intentionally targets a remote branch without a local twin.
+    Skipped,
     Deleted,
     /// `-D` was needed; we only force after verifying the merge ourselves.
     ForceDeleted,
@@ -71,7 +73,9 @@ pub fn delete_one(
     let mut undo = Vec::new();
 
     // Invariants scan.rs already enforces, re-asserted before destruction.
-    let local = if Some(c.name.as_str()) == current {
+    let local = if c.scope == CandidateScope::RemoteOnly {
+        LocalOutcome::Skipped
+    } else if Some(c.name.as_str()) == current {
         LocalOutcome::Failed("refusing to delete the checked-out branch".to_string())
     } else if c.name == base.name || Some(&c.refname) == base.refname.as_ref() {
         LocalOutcome::Failed("refusing to delete the base branch".to_string())
@@ -197,11 +201,14 @@ pub fn remote_branch(c: &Candidate) -> Option<(String, String)> {
         return None;
     }
     let remote = c.remote_name.clone()?;
-    let branch = c
-        .upstream
-        .as_ref()?
-        .strip_prefix(&format!("{remote}/"))?
-        .to_string();
+    let branch = if c.scope == CandidateScope::RemoteOnly {
+        c.name.strip_prefix(&format!("{remote}/"))?.to_string()
+    } else {
+        c.upstream
+            .as_ref()?
+            .strip_prefix(&format!("{remote}/"))?
+            .to_string()
+    };
     Some((remote, branch))
 }
 
@@ -238,6 +245,7 @@ mod tests {
             refname: format!("refs/heads/{name}"),
             sha: SHA.into(),
             kind,
+            scope: CandidateScope::Local,
             upstream: Some(format!("origin/{name}")),
             remote_name: Some("origin".into()),
             upstream_gone: kind == MergeKind::Gone,
@@ -279,6 +287,67 @@ mod tests {
         assert_eq!(r.local, LocalOutcome::Deleted);
         assert_eq!(r.remote, RemoteOutcome::Skipped);
         assert_eq!(r.undo, vec!["git branch feat 0123456789ab"]);
+    }
+
+    fn remote_only_plan(name: &str) -> PlannedDeletion {
+        let mut c = candidate(name, MergeKind::Merged);
+        c.scope = CandidateScope::RemoteOnly;
+        c.name = format!("origin/{name}");
+        c.refname = format!("refs/remotes/origin/{name}");
+        c.upstream = Some(format!("origin/{name}"));
+        PlannedDeletion {
+            candidate: c,
+            delete_remote: true,
+        }
+    }
+
+    #[test]
+    fn remote_only_candidate_deletes_the_remote_and_touches_no_local_branch() {
+        // The destructive half of the remote-only flow: there is no local
+        // branch to remove, so `git branch -d/-D` must never be reached.
+        let git = FakeGit::default()
+            .on(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/remotes/origin/feat",
+                ],
+                Ok(&format!("{SHA}\n")),
+            )
+            .on(
+                &[
+                    "push",
+                    &format!("--force-with-lease=refs/heads/feat:{SHA}"),
+                    "origin",
+                    ":refs/heads/feat",
+                ],
+                Ok(""),
+            );
+        let r = delete_one(&git, &base(), Some("main"), &remote_only_plan("feat"));
+        assert_eq!(r.local, LocalOutcome::Skipped);
+        assert_eq!(
+            r.remote,
+            RemoteOutcome::Deleted {
+                target: "origin/feat".into(),
+                sha: SHA.into(),
+            }
+        );
+        // Undo restores only the remote ref; there was no local branch.
+        assert_eq!(r.undo, vec!["git push origin 0123456789ab:refs/heads/feat"]);
+    }
+
+    #[test]
+    fn remote_only_candidate_is_inert_without_delete_remote() {
+        // Selecting the row but not arming the remote toggle must do nothing
+        // at all, rather than falling through to a local deletion.
+        let git = FakeGit::default();
+        let mut plan = remote_only_plan("feat");
+        plan.delete_remote = false;
+        let r = delete_one(&git, &base(), Some("main"), &plan);
+        assert_eq!(r.local, LocalOutcome::Skipped);
+        assert_eq!(r.remote, RemoteOutcome::Skipped);
+        assert!(r.undo.is_empty());
     }
 
     #[test]

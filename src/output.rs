@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::ops;
-use crate::scan::{Candidate, MergeKind, Scan};
+use crate::scan::{Candidate, CandidateScope, MergeKind, Scan};
 
 pub fn human_list(scan: &Scan, now_unix: i64) -> String {
     let mut out = String::new();
@@ -27,24 +27,43 @@ pub fn human_list(scan: &Scan, now_unix: i64) -> String {
             (Some(u), false) => format!("  ↑ {u}"),
             (None, _) => String::new(),
         };
+        // Remote-only rows are labelled in place: the kind column alone would
+        // read as an ordinary local branch that `--yes` is about to delete.
+        let scope = match c.scope {
+            CandidateScope::RemoteOnly => "  [remote-only]",
+            CandidateScope::Local => "",
+        };
         out.push_str(&format!(
-            "  {:name_w$}  {:6}  {:>4} ago{}\n",
+            "  {:name_w$}  {:6}  {:>4} ago{}{}\n",
             c.name,
             kind_label(c.kind),
             age(now_unix, c.last_commit_unix),
+            scope,
             upstream,
         ));
     }
 
+    // `--yes` never touches remote-only candidates, so the count it is
+    // advertised next to must not include them.
     let selected = scan
         .candidates
         .iter()
-        .filter(|c| c.selected_by_default())
+        .filter(|c| c.scope == CandidateScope::Local && c.selected_by_default())
         .count();
     out.push_str(&format!(
         "\n{} candidate(s), {selected} selected by default. Run `git barber` for the TUI or `git barber --yes` to delete.\n",
         scan.candidates.len(),
     ));
+    let remote_only = scan
+        .candidates
+        .iter()
+        .filter(|c| c.scope == CandidateScope::RemoteOnly)
+        .count();
+    if remote_only > 0 {
+        out.push_str(&format!(
+            "tip: {remote_only} remote-only branch(es) are merged but have no local twin; they are deletable only from the TUI, never by --yes.\n"
+        ));
+    }
     if scan.candidates.iter().any(|c| c.kind == MergeKind::Gone) {
         out.push_str("tip: gone branches are never deleted without explicit consent (--include-gone or a manual TUI check).\n");
     }
@@ -97,6 +116,7 @@ pub fn json_list(scan: &Scan) -> Result<String> {
 /// force was justified (a gone branch is consented-to, not verified).
 pub(crate) fn local_label(r: &ops::DeletionResult) -> String {
     match (&r.local, r.kind) {
+        (ops::LocalOutcome::Skipped, _) => "remote only".to_string(),
         (ops::LocalOutcome::Deleted, _) => "deleted".to_string(),
         (ops::LocalOutcome::ForceDeleted, MergeKind::Merged) => {
             "force-deleted (verified merged into base)".to_string()
@@ -204,6 +224,7 @@ mod tests {
             refname: format!("refs/heads/{name}"),
             sha: "abc123".into(),
             kind,
+            scope: crate::scan::CandidateScope::Local,
             upstream: Some(format!("origin/{name}")),
             remote_name: Some("origin".into()),
             upstream_gone: kind == MergeKind::Gone,
