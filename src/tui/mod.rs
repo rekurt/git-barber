@@ -2,6 +2,7 @@ mod app;
 mod ui;
 
 use std::process::ExitCode;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -9,7 +10,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 
 use crate::git::Git;
 use crate::ops;
-use crate::scan::{Base, Candidate, Scan};
+use crate::scan::{Base, Scan};
 use app::{Action, App};
 
 /// Run the interactive TUI. `ratatui::try_init` installs a panic hook that
@@ -51,14 +52,14 @@ pub fn run(
 ///
 /// Ranges are built from full refnames, so a branch called `-f` cannot turn
 /// into a git option.
-fn preview_text(git: &dyn Git, base: &Base, candidate: &Candidate) -> String {
+fn preview_text(git: &dyn Git, base: &Base, branch_ref: &str) -> String {
     const MAX_COMMITS: &str = "--max-count=20";
     let log = git.run(&[
         "log",
         "--oneline",
         "--no-decorate",
         MAX_COMMITS,
-        &format!("{}..{}", base.rev(), candidate.refname),
+        &format!("{}..{}", base.rev(), branch_ref),
         "--",
     ]);
     // `--shortstat` renders a diff, so it can otherwise run a configured
@@ -70,7 +71,7 @@ fn preview_text(git: &dyn Git, base: &Base, candidate: &Candidate) -> String {
         "--shortstat",
         "--no-ext-diff",
         "--no-textconv",
-        &format!("{}...{}", base.rev(), candidate.refname),
+        &format!("{}...{}", base.rev(), branch_ref),
         "--",
     ]);
     match log {
@@ -98,21 +99,64 @@ fn event_loop(
     app: &mut App,
     git: &dyn Git,
 ) -> Result<ExitCode> {
+    // Previews run on their own thread. Fetching them inline would put two
+    // git subprocesses between the draw and the next `event::poll`, so every
+    // move onto an unseen branch would freeze input until they finished —
+    // exactly the lag the panel is supposed to avoid.
+    std::thread::scope(|scope| {
+        let (want_tx, want_rx) = channel::<(String, String)>();
+        let (done_tx, done_rx) = channel::<(String, String)>();
+        let base = app.base.clone();
+        scope.spawn(move || {
+            while let Ok(oldest) = want_rx.recv() {
+                // Serve the NEWEST request, not the oldest. Scrolling through
+                // a long list queues one per branch passed, and answering
+                // them in order would leave the branch actually being looked
+                // at until last. Anything skipped is simply re-requested if
+                // the cursor comes back to it.
+                let (name, branch_ref) = want_rx.try_iter().last().unwrap_or(oldest);
+                let text = preview_text(git, &base, &branch_ref);
+                if done_tx.send((name, text)).is_err() {
+                    return;
+                }
+            }
+        });
+        let outcome = drive(terminal, app, &want_tx, &done_rx, git);
+        // Closing the request channel ends the worker, which is what lets
+        // this scope join instead of hanging on exit.
+        drop(want_tx);
+        outcome
+    })
+}
+
+fn drive(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    want: &Sender<(String, String)>,
+    done: &Receiver<(String, String)>,
+    git: &dyn Git,
+) -> Result<ExitCode> {
+    // The one request currently with the worker. Tracking just this — rather
+    // than every branch ever asked for — is what makes a skipped preview
+    // self-healing: nothing is permanently marked as requested, so returning
+    // to a branch asks again.
+    let mut in_flight: Option<String> = None;
     loop {
+        for (name, text) in done.try_iter() {
+            if in_flight.as_deref() == Some(name.as_str()) {
+                in_flight = None;
+            }
+            app.set_preview(name, text);
+        }
+
         terminal.draw(|f| ui::render(f, app))?;
 
-        // Fetch the highlighted branch's preview AFTER drawing, then redraw.
-        // That way cursor movement stays at full speed and the panel catches
-        // up, instead of every keypress waiting on a git call.
-        if app.pending_preview().is_some()
+        if let Some(wanted) = app.pending_preview().map(str::to_string)
+            && in_flight.as_deref() != Some(wanted.as_str())
             && let Some(candidate) = app.highlighted_candidate()
         {
-            let (name, text) = (
-                candidate.name.clone(),
-                preview_text(git, &app.base, candidate),
-            );
-            app.set_preview(name, text);
-            terminal.draw(|f| ui::render(f, app))?;
+            let _ = want.send((wanted.clone(), candidate.refname.clone()));
+            in_flight = Some(wanted);
         }
 
         if event::poll(Duration::from_millis(200))?
@@ -160,28 +204,12 @@ fn event_loop(
 mod tests {
     use super::*;
     use crate::git::fake::FakeGit;
-    use crate::scan::MergeKind;
 
     fn base() -> Base {
         Base {
             name: "origin/main".into(),
             refname: Some("refs/remotes/origin/main".into()),
             sha: "base000".into(),
-        }
-    }
-
-    fn candidate(name: &str) -> Candidate {
-        Candidate {
-            name: name.into(),
-            refname: format!("refs/heads/{name}"),
-            sha: "0123456789abcdef0123".into(),
-            kind: MergeKind::Squash,
-            upstream: Some(format!("origin/{name}")),
-            remote_name: Some("origin".into()),
-            upstream_gone: false,
-            last_commit_unix: 0,
-            subject: "subject".into(),
-            upstream_ref: Some(format!("refs/remotes/origin/{name}")),
         }
     }
 
@@ -222,7 +250,7 @@ mod tests {
             Ok("abc1234 add thing\ndef5678 fix thing\n"),
             Ok(" 2 files changed, 10 insertions(+), 1 deletion(-)\n"),
         );
-        let text = preview_text(&git, &base(), &candidate("feat"));
+        let text = preview_text(&git, &base(), "refs/heads/feat");
         assert!(text.contains("abc1234 add thing"), "{text}");
         assert!(text.contains("def5678 fix thing"), "{text}");
         assert!(text.contains("2 files changed"), "{text}");
@@ -233,7 +261,7 @@ mod tests {
         // The user is mid-way through choosing what to delete; a broken
         // preview must not throw that away.
         let git = git_for("feat", Err("fatal: bad object"), Err("fatal: bad object"));
-        let text = preview_text(&git, &base(), &candidate("feat"));
+        let text = preview_text(&git, &base(), "refs/heads/feat");
         assert!(text.contains("preview unavailable"), "{text}");
         assert!(text.contains("bad object"), "{text}");
     }
@@ -241,7 +269,7 @@ mod tests {
     #[test]
     fn a_branch_carrying_nothing_new_says_so_instead_of_showing_a_blank_panel() {
         let git = git_for("feat", Ok(""), Ok(""));
-        let text = preview_text(&git, &base(), &candidate("feat"));
+        let text = preview_text(&git, &base(), "refs/heads/feat");
         assert!(text.contains("no commits"), "{text}");
     }
 
@@ -250,7 +278,7 @@ mod tests {
         // `git diff` can fail on its own (e.g. a corrupt index) — that must
         // cost the stat line, not the whole preview.
         let git = git_for("feat", Ok("abc1234 add thing\n"), Err("fatal: broken"));
-        let text = preview_text(&git, &base(), &candidate("feat"));
+        let text = preview_text(&git, &base(), "refs/heads/feat");
         assert!(text.contains("abc1234 add thing"), "{text}");
         assert!(!text.contains("preview unavailable"), "{text}");
     }

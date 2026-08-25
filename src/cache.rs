@@ -96,8 +96,17 @@ impl Cache {
     pub fn save(&self, git_dir: &Path) {
         let file = path(git_dir);
         let Some(dir) = file.parent() else { return };
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
+        // `create_dir_all` is satisfied by a SYMLINK to a directory and then
+        // both the temp file and the rename land wherever it points — which
+        // would undo the leaf-level protection below. This directory is ours
+        // to create, so anything already in its place that is not a real
+        // directory is refused rather than followed. `symlink_metadata` is
+        // the load-bearing part: it does not follow links.
+        match std::fs::symlink_metadata(dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return,
+            Err(_) if std::fs::create_dir(dir).is_ok() => {}
+            Err(_) => return,
         }
         let entries = self
             .entries
@@ -309,6 +318,34 @@ mod tests {
             std::fs::read_to_string(&victim).unwrap(),
             "PRECIOUS DATA",
             "the cache write escaped the repository"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_cache_directory_is_refused() {
+        // Protecting the file names is not enough: if `.git/barber` itself is
+        // a symlink, `create_dir_all` follows it and both the temp file and
+        // the rename land in the linked directory instead. A repository you
+        // did not author could point it anywhere the user can write.
+        let tmp = TempDir::new().unwrap();
+        let git_dir = tmp.path().join("gitdir");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, git_dir.join("barber")).unwrap();
+
+        let mut cache = Cache::default();
+        cache.insert(key("b", "f", "x"), Some(MergeKind::Squash));
+        cache.save(&git_dir);
+
+        let leaked: Vec<String> = std::fs::read_dir(&outside)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the cache write escaped through a symlinked directory: {leaked:?}"
         );
     }
 

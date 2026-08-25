@@ -6,10 +6,12 @@ on:
 permissions:
   contents: read
 
-# Two tags pushed close together would otherwise race on `gh release create`
-# and on the tap push.
+# Repository-wide on purpose, NOT keyed on github.ref: two different tags
+# would get different groups and still run at once, and their Homebrew jobs
+# would clone the same tap head and push divergent commits — one of which
+# gets rejected, leaving that release missing from the tap.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
