@@ -228,6 +228,7 @@ mod tests {
         Base {
             name: "origin/main".into(),
             refname: Some("refs/remotes/origin/main".into()),
+            sha: "base000".into(),
         }
     }
 

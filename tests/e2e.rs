@@ -622,3 +622,177 @@ fn undo_hint_actually_restores_the_branch() {
     git(&dir, &undo_args);
     assert_eq!(git(&dir, &["rev-parse", "feature"]).trim(), sha);
 }
+
+#[test]
+fn completions_are_generated_outside_a_repository() {
+    // A shell sources completion scripts at startup, long before any
+    // repository is in sight: generating them must not need (or touch) one.
+    // The tempdir here is deliberately NOT a git repo.
+    let tmp = TempDir::new().unwrap();
+    let out = barber(tmp.path())
+        .args(["--completions", "zsh"])
+        .assert()
+        .success();
+    let script = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    // Completions must register against the executable on PATH, not against
+    // clap's bin_name ("git barber") — git dispatches the subcommand form.
+    assert!(
+        script.contains("#compdef git-barber"),
+        "zsh script must register git-barber, got: {script}"
+    );
+}
+
+#[test]
+fn man_page_is_generated_outside_a_repository() {
+    let tmp = TempDir::new().unwrap();
+    let out = barber(tmp.path()).arg("--man").assert().success();
+    let roff = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(roff.contains(".TH"), "not a roff document: {roff}");
+    assert!(roff.contains("SYNOPSIS"), "man page lacks SYNOPSIS: {roff}");
+}
+
+#[test]
+fn scan_result_is_identical_however_many_jobs_run() {
+    // Characterisation test for the parallel scan: the number of workers is a
+    // performance knob and must never change what is found, in what order, or
+    // how it is classified.
+    let (_tmp, dir) = repo();
+    for i in 0..8 {
+        let branch = format!("feature-{i}");
+        let file = format!("f{i}.txt");
+        git(&dir, &["checkout", "-b", &branch]);
+        commit_file(&dir, &file, &format!("work {i}"), &format!("add {file}"));
+        git(&dir, &["checkout", "main"]);
+        // Squash merges are the expensive path: they force the patch-id
+        // probes that the workers actually parallelise.
+        git(&dir, &["merge", "--squash", &branch]);
+        git(&dir, &["commit", "-m", &format!("{branch} (squashed)")]);
+    }
+
+    git(&dir, &["config", "barber.jobs", "1"]);
+    let sequential = list_json(&dir);
+    git(&dir, &["config", "barber.jobs", "8"]);
+    let parallel = list_json(&dir);
+
+    assert_eq!(
+        branch_kinds(&sequential),
+        (0..8)
+            .map(|i| (format!("feature-{i}"), "squash".to_string()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        sequential, parallel,
+        "worker count must not change the scan result"
+    );
+}
+
+#[test]
+fn a_warm_cache_returns_the_same_answer_as_a_cold_one() {
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "f.txt", "feature", "add feature");
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--squash", "feature"]);
+    git(&dir, &["commit", "-m", "feature (squashed)"]);
+
+    let cold = list_json(&dir);
+    assert!(
+        dir.join(".git/barber/cache.json").exists(),
+        "cache not written"
+    );
+    let warm = list_json(&dir);
+    assert_eq!(cold, warm, "a cached verdict must match the computed one");
+}
+
+#[test]
+fn a_branch_that_moves_after_being_cached_is_probed_again() {
+    // The safety-critical property of the cache. A stale hit here would
+    // force-delete a branch carrying commits nothing ever verified.
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "f.txt", "feature", "add feature");
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--squash", "feature"]);
+    git(&dir, &["commit", "-m", "feature (squashed)"]);
+
+    assert_eq!(
+        branch_kinds(&list_json(&dir)),
+        vec![("feature".into(), "squash".into())],
+        "expected the verdict to be cached as squash first"
+    );
+
+    // New, unmerged work lands on the branch.
+    git(&dir, &["checkout", "feature"]);
+    commit_file(&dir, "g.txt", "more", "unmerged follow-up");
+    git(&dir, &["checkout", "main"]);
+
+    assert_eq!(
+        branch_kinds(&list_json(&dir)),
+        vec![],
+        "the moved branch must not keep its stale squash verdict"
+    );
+}
+
+#[test]
+fn progress_never_touches_stdout_and_stays_silent_off_a_terminal() {
+    // `git barber --json | jq .` has to keep working. The scan counter is
+    // written to stderr, and only when stderr is a terminal — under a pipe
+    // (which is what this test is) it must produce nothing at all.
+    let (_tmp, dir) = repo();
+    for i in 0..3 {
+        let branch = format!("feature-{i}");
+        git(&dir, &["checkout", "-b", &branch]);
+        commit_file(&dir, &format!("f{i}.txt"), "work", "add work");
+        git(&dir, &["checkout", "main"]);
+        git(&dir, &["merge", "--squash", &branch]);
+        git(&dir, &["commit", "-m", "squashed"]);
+    }
+
+    let out = barber(&dir).arg("--json").assert().success();
+    let stdout = &out.get_output().stdout;
+    let stderr = &out.get_output().stderr;
+
+    serde_json::from_slice::<serde_json::Value>(stdout).expect("--json stdout must parse");
+    assert!(
+        !stdout.contains(&0x1b),
+        "stdout must carry no escape sequences"
+    );
+    assert!(
+        stderr.is_empty(),
+        "stderr must be silent off a terminal, got: {}",
+        String::from_utf8_lossy(stderr)
+    );
+}
+
+#[test]
+fn no_cache_neither_reads_nor_writes_the_cache() {
+    // A destructive tool needs a way to force full re-verification. Without
+    // it, a user who suspects the cache has nothing to fall back on.
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "f.txt", "feature", "add feature");
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--squash", "feature"]);
+    git(&dir, &["commit", "-m", "feature (squashed)"]);
+
+    let cache = dir.join(".git/barber/cache.json");
+    barber(&dir)
+        .args(["--json", "--no-cache"])
+        .assert()
+        .success();
+    assert!(!cache.exists(), "--no-cache must not write a cache");
+
+    // It must also not consult one that already exists.
+    barber(&dir).arg("--json").assert().success();
+    assert!(cache.exists(), "a normal run should have written one");
+    let before = std::fs::read_to_string(&cache).unwrap();
+    barber(&dir)
+        .args(["--json", "--no-cache"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&cache).unwrap(),
+        before,
+        "--no-cache must leave an existing cache untouched"
+    );
+}

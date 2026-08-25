@@ -14,9 +14,22 @@ exclude = ["/assets", "/.github"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
+clap_mangen = "0.2"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Prebuilt binaries from GitHub Releases, so `cargo binstall git-barber`
+# downloads instead of compiling. Asset names must match release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+# Mirrors the staging directory the release workflow tars up.
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [dev-dependencies]
 assert_cmd = "2"

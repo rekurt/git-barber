@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Prebuilt binaries for macOS (arm64, x86_64), Linux (arm64, x86_64, musl) and
+  Windows on every tagged release, plus a Homebrew tap and `cargo binstall`
+  support — installing no longer requires a Rust toolchain.
+- `--completions <SHELL>` generates bash/zsh/fish/powershell completion
+  scripts, and a man page is shipped in the release archives. Both work
+  outside a repository.
+- Parallel scanning across `barber.jobs` workers (default: CPU count, capped
+  at 8) and a cross-run verdict cache in `.git/barber/cache.json`, keyed on
+  the base tip, fork point and branch tip so a moved branch is always probed
+  again. A 200-branch repository scans in ~5s instead of ~25s, or ~1.6s warm.
+- A progress counter on stderr while scanning, shown only when stderr is a
+  terminal so piped output is unaffected.
+- `--no-cache` ignores and does not update the verdict cache, forcing every
+  branch to be re-verified from scratch.
+- A commit-preview panel in the TUI: the commits the highlighted branch has
+  that the base does not, plus its diffstat. Beside the list at 100 columns or
+  wider, underneath below that, lazily loaded and cached per branch. Toggle
+  with `p`; disable with `git config barber.preview false`.
+
 ## [0.1.0] - 2026-08-02
 
 ### Added

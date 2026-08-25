@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::Parser;
+use clap_complete::Shell;
 
 /// Trim stale merged git branches — classic merges, squash merges, and
 /// branches whose upstream is gone. Runs a TUI by default; use --list or
@@ -49,10 +50,43 @@ pub struct Cli {
     /// Run as if started in PATH (passed to `git -C`)
     #[arg(short = 'C', value_name = "PATH")]
     pub dir: Option<PathBuf>,
+
+    /// Ignore and do not update the verdict cache in `.git/barber`, forcing
+    /// every branch to be re-verified from scratch
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Print a completion script for SHELL to stdout and exit
+    #[arg(long, value_name = "SHELL")]
+    pub completions: Option<Shell>,
+
+    /// Print the roff man page to stdout and exit (used by the release build)
+    #[arg(long, hide = true)]
+    pub man: bool,
+}
+
+/// The name completions and the man page are generated for. Deliberately
+/// NOT clap's `bin_name` ("git barber"): a completion script has to register
+/// against the executable on PATH, and git dispatches its own completion for
+/// the subcommand form.
+pub const BIN_NAME: &str = "git-barber";
+
+/// Write a shell completion script to `out`.
+pub fn completions(shell: Shell, out: &mut dyn std::io::Write) {
+    use clap::CommandFactory;
+    clap_complete::generate(shell, &mut Cli::command(), BIN_NAME, out);
+}
+
+/// Write the roff man page to `out`.
+pub fn man(out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    use clap::CommandFactory;
+    clap_mangen::Man::new(Cli::command().name(BIN_NAME)).render(out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
+    /// Print a completion script or man page; never touches a repository.
+    Generate,
     /// Interactive TUI (default in a terminal).
     Tui,
     /// Read-only listing, human or JSON.
@@ -68,7 +102,9 @@ impl Cli {
     }
 
     fn mode_with(&self, tty: bool) -> Mode {
-        if self.yes {
+        if self.completions.is_some() || self.man {
+            Mode::Generate
+        } else if self.yes {
             Mode::Execute
         } else if self.list || self.json || !tty {
             Mode::List
@@ -121,6 +157,19 @@ mod tests {
         assert_eq!(parse(&["--json"]).mode_with(true), Mode::List);
         assert_eq!(parse(&["--list"]).mode_with(true), Mode::List);
         assert_eq!(parse(&["--dry-run"]).mode_with(true), Mode::List);
+    }
+
+    #[test]
+    fn completions_and_man_are_a_repository_free_mode() {
+        // Generating a completion script or man page must work anywhere,
+        // including outside a repository, so it cannot fall through to a
+        // mode that scans one. --man is checked with tty=false because the
+        // release build pipes it to a file.
+        assert_eq!(
+            parse(&["--completions", "zsh"]).mode_with(true),
+            Mode::Generate
+        );
+        assert_eq!(parse(&["--man"]).mode_with(false), Mode::Generate);
     }
 
     #[test]

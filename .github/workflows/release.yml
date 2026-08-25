@@ -6,14 +6,28 @@ on:
 permissions:
   contents: read
 
+# Repository-wide on purpose, NOT keyed on github.ref: two different tags
+# would get different groups and still run at once, and their Homebrew jobs
+# would clone the same tap head and push divergent commits — one of which
+# gets rejected, leaving that release missing from the tap.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  publish:
+  # Gate everything behind the same checks CI runs, plus the tag/version
+  # agreement. Nothing is published or uploaded if this fails.
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Tag must match Cargo.toml version
         run: |
           # --locked: pkgid must not silently repair a stale Cargo.lock that
@@ -24,6 +38,225 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # A tag must not be able to publish a dependency set that CI never vetted.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Completions and the man page are pure renderings of the CLI definition,
+  # identical for every target. Generate them once with a native build rather
+  # than trying to execute cross-compiled binaries on the build runners.
+  assets:
+    needs: [check, deny]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Generate completions and man page
+        run: |
+          mkdir -p dist/completions dist/man
+          for shell in bash zsh fish powershell; do
+            ./target/release/git-barber --completions "$shell" > "dist/completions/git-barber.$shell"
+          done
+          ./target/release/git-barber --man > dist/man/git-barber.1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shared-assets
+          path: dist/
+          retention-days: 1
+
+  build:
+    needs: assets
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          # Native arm64 runner: cross-compiling to aarch64 musl would need a
+          # cross linker and a docker-based toolchain for no benefit.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: shared-assets
+          path: shared-assets
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="git-barber-v${version}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          # bin-dir in Cargo.toml's [package.metadata.binstall] mirrors this
+          # layout — keep the two in step or `cargo binstall` breaks.
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp "target/${{ matrix.target }}/release/git-barber.exe" "$stage/"
+          else
+            cp "target/${{ matrix.target }}/release/git-barber" "$stage/"
+          fi
+          cp -r shared-assets/completions shared-assets/man "$stage/"
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a "$stage.zip" "$stage" > /dev/null
+            certutil -hashfile "$stage.zip" SHA256 | sed -n 2p | tr -d ' \r' > "$stage.zip.sha256"
+          else
+            tar czf "$stage.tar.gz" "$stage"
+            if command -v sha256sum > /dev/null; then
+              sha256sum "$stage.tar.gz" | cut -d' ' -f1 > "$stage.tar.gz.sha256"
+            else
+              shasum -a 256 "$stage.tar.gz" | cut -d' ' -f1 > "$stage.tar.gz.sha256"
+            fi
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            git-barber-v*.tar.gz
+            git-barber-v*.zip
+            git-barber-v*.sha256
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/CHANGELOG.md)." \
+            dist/*
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  # No-ops until HOMEBREW_TAP_TOKEN exists, so the release is never blocked
+  # on the tap being set up.
+  homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update the Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set — skipping the tap update."
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+          sha() {
+            gh release download "$GITHUB_REF_NAME" -p "$1.sha256" -O - -R "$GITHUB_REPOSITORY"
+          }
+          arm_mac=$(sha "git-barber-v${version}-aarch64-apple-darwin.tar.gz")
+          x86_mac=$(sha "git-barber-v${version}-x86_64-apple-darwin.tar.gz")
+          arm_linux=$(sha "git-barber-v${version}-aarch64-unknown-linux-musl.tar.gz")
+          x86_linux=$(sha "git-barber-v${version}-x86_64-unknown-linux-musl.tar.gz")
+          # These end up in a formula that runs on every user's machine.
+          # Shell expansion inside a heredoc is not re-scanned, so injection
+          # is not possible here, but a checksum that is not a checksum means
+          # something upstream is wrong — fail rather than ship it.
+          for digest in "$arm_mac" "$x86_mac" "$arm_linux" "$x86_linux"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { echo "bad sha256: $digest"; exit 1; }
+          done
+
+          # The token goes in a header, not in the remote URL: a URL would
+          # persist it in tap/.git/config for anything later to leak.
+          git clone "https://github.com/${GITHUB_REPOSITORY_OWNER}/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/git-barber.rb <<EOF
+          class GitBarber < Formula
+            desc "Trim stale merged git branches (classic + squash merges), with a TUI"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            version "${version}"
+            license any_of: ["MIT", "Apache-2.0"]
+
+            on_macos do
+              on_arm do
+                url "${base}/git-barber-v${version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${arm_mac}"
+              end
+              on_intel do
+                url "${base}/git-barber-v${version}-x86_64-apple-darwin.tar.gz"
+                sha256 "${x86_mac}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/git-barber-v${version}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${arm_linux}"
+              end
+              on_intel do
+                url "${base}/git-barber-v${version}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${x86_linux}"
+              end
+            end
+
+            def install
+              bin.install "git-barber"
+              bash_completion.install "completions/git-barber.bash" => "git-barber"
+              zsh_completion.install "completions/git-barber.zsh" => "_git-barber"
+              fish_completion.install "completions/git-barber.fish"
+              man1.install "man/git-barber.1"
+            end
+
+            test do
+              assert_match "git-barber", shell_output("#{bin}/git-barber --version")
+            end
+          end
+          EOF
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/git-barber.rb
+          git commit -m "git-barber ${version}"
+          git -c http.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 | tr -d '\n')" push

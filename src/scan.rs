@@ -1,12 +1,16 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::cache::{Cache, Key};
 use crate::git::Git;
+use crate::parallel;
+use crate::progress::Reporter;
 
 /// How we concluded a branch is safe to trim, ordered by confidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeKind {
     /// Tip is an ancestor of the base branch (ancestry check).
@@ -29,6 +33,10 @@ pub struct Base {
     /// Full refname when the base is a ref (e.g. "refs/remotes/origin/main").
     /// None when --base was given a raw commit.
     pub refname: Option<String>,
+    /// Resolved tip. Part of every cache key: everything the base gained
+    /// since a fork point is exactly what squash/rebase detection compares
+    /// against, so a moved base must invalidate cached verdicts.
+    pub sha: String,
 }
 
 impl Base {
@@ -81,7 +89,24 @@ const FORMAT: &str = "--format=%(refname)%00%(objectname)%00%(upstream)%00%(upst
 
 pub const DEFAULT_PROTECTED: [&str; 3] = ["main", "master", "develop"];
 
-pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) -> Result<Scan> {
+/// What the caller wants scanned, as opposed to how progress is reported or
+/// where verdicts are cached.
+pub struct Options<'a> {
+    /// `--base`; None auto-detects.
+    pub base: Option<&'a str>,
+    /// Extra protected names or globs, on top of config and the defaults.
+    pub protect: &'a [String],
+    /// Scan worker threads.
+    pub jobs: usize,
+}
+
+pub fn scan(
+    git: &dyn Git,
+    opts: &Options,
+    reporter: &dyn Reporter,
+    cache: &mut Cache,
+) -> Result<Scan> {
+    let (base_flag, extra_protect, jobs) = (opts.base, opts.protect, opts.jobs);
     let base = resolve_base(git, base_flag)?;
     let current = current_branch(git)?;
     let protected = protected_patterns(git, extra_protect)?;
@@ -98,12 +123,17 @@ pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) ->
         warnings.push("shallow repository: squash/rebase detection is disabled".to_string());
     }
 
+    // Every query below is pinned to the sha resolved at scan start, not to
+    // the base REF, which git would re-resolve per call. A fetch landing
+    // mid-scan would otherwise judge early branches against one base tip and
+    // later ones against another — and, worse, cache a verdict under a key
+    // naming a base it was not computed against.
     let merged: HashSet<String> = git
         .run(&[
             "for-each-ref",
             "refs/heads",
             "--merged",
-            base.rev(),
+            &base.sha,
             "--format=%(refname)",
         ])?
         .lines()
@@ -113,61 +143,169 @@ pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) ->
     // The local twin of a remote base: base `origin/main` → `refs/heads/main`.
     let base_local = base_local_counterpart(git, &base)?;
 
-    let mut upstream_cache = HashMap::new();
-    let mut candidates = Vec::new();
-    for line in git.run(&["for-each-ref", "refs/heads", FORMAT])?.lines() {
-        let Some(b) = RawBranch::parse(line) else {
-            continue;
-        };
-        // Never candidates: branches checked out in any worktree, the base
-        // itself, its local twin, protected names. (Merely TRACKING the base
-        // is not an exclusion: `git switch -c feat origin/main` sets exactly
-        // that upstream on perfectly ordinary feature branches.)
-        if held.contains(&b.refname)
-            || current.as_deref() == Some(b.name.as_str())
-            || Some(&b.refname) == base.refname.as_ref()
-            || Some(&b.refname) == base_local.as_ref()
-            || is_protected(&b.name, &protected)
-        {
-            continue;
+    let raw = git.run(&["for-each-ref", "refs/heads", FORMAT])?;
+    let branches: Vec<RawBranch> = raw.lines().filter_map(RawBranch::parse).collect();
+
+    // Exclusions are pure predicates over data already in hand — no git calls
+    // at all — so they run first and shrink the expensive phases below.
+    // Never candidates: branches checked out in any worktree, the base itself,
+    // its local twin, protected names. (Merely TRACKING the base is not an
+    // exclusion: `git switch -c feat origin/main` sets exactly that upstream
+    // on perfectly ordinary feature branches.)
+    let examinable: Vec<RawBranch> = branches
+        .into_iter()
+        .filter(|b| {
+            !(held.contains(&b.refname)
+                || current.as_deref() == Some(b.name.as_str())
+                || Some(&b.refname) == base.refname.as_ref()
+                || Some(&b.refname) == base_local.as_ref()
+                || is_protected(&b.name, &protected))
+        })
+        .collect();
+
+    let total = examinable.len();
+    let done = AtomicUsize::new(0);
+    let tick = || reporter.tick(done.fetch_add(1, Ordering::Relaxed) + 1, total);
+
+    // Ancestry already answered these; they cost nothing more.
+    for _ in examinable.iter().filter(|b| merged.contains(&b.refname)) {
+        tick();
+    }
+
+    // Everything else needs patch-id probing, which is where the time goes —
+    // except on a shallow clone, where there is no history to probe. Those
+    // branches still tick: a counter that stops short of its total reads as
+    // an aborted scan.
+    let unmerged = examinable.iter().filter(|b| !merged.contains(&b.refname));
+    let to_probe: Vec<&RawBranch> = if shallow {
+        unmerged.for_each(|_| tick());
+        Vec::new()
+    } else {
+        unmerged.collect()
+    };
+
+    let mut probed: HashMap<&str, MergeKind> = HashMap::new();
+
+    let mut fresh: Vec<(Key, Option<MergeKind>)> = Vec::new();
+
+    if !to_probe.is_empty() {
+        // Phase 1: fork points. One cheap call per branch, run concurrently.
+        // Needed even for cache hits, because the fork point is part of the
+        // key that decides whether a hit is still valid.
+        let forks = parallel::map(&to_probe, jobs, |b| merge_base(git, &base, &b.sha));
+
+        // Anything already resolved by an earlier run with all three shas
+        // unchanged is taken as-is; only the rest costs anything.
+        let mut to_walk: Vec<(&&RawBranch, &Result<Option<String>>)> = Vec::new();
+        for (b, fork) in to_probe.iter().zip(forks.iter()) {
+            match fork {
+                Ok(Some(mb)) => match cache.get(&Key::new(&base.sha, mb, &b.sha)) {
+                    Some(verdict) => {
+                        if let Some(kind) = verdict {
+                            probed.insert(b.refname.as_str(), kind);
+                        }
+                        tick();
+                    }
+                    None => to_walk.push((b, fork)),
+                },
+                // No common history, or the call failed: nothing to cache.
+                _ => to_walk.push((b, fork)),
+            }
         }
 
+        // Phase 2: the expensive upstream walk, once per DISTINCT fork point,
+        // and only for fork points a cache miss actually needs. Branches cut
+        // from the same commit share one walk — the common case by far, and
+        // the reason this is not simply folded into phase 3.
+        let mut distinct: Vec<String> = to_walk
+            .iter()
+            .filter_map(|(_, fork)| fork.as_ref().ok().and_then(|f| f.clone()))
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let sets = parallel::map(&distinct, jobs, |mb| upstream_patch_ids(git, &base, mb));
+        let mut walks: HashMap<&str, HashSet<String>> = HashMap::new();
+        for (mb, set) in distinct.iter().zip(sets) {
+            match set {
+                Ok(ids) => {
+                    walks.insert(mb.as_str(), ids);
+                }
+                // One unwalkable fork point must not abort the whole scan.
+                // The fork point is a bare sha and means nothing to the user,
+                // so the warning names every branch it actually cost.
+                Err(e) => warnings.extend(
+                    to_walk
+                        .iter()
+                        .filter(|(_, fork)| matches!(fork, Ok(Some(f)) if f == mb))
+                        .map(|(b, _)| format!("{}: merge probe failed: {e:#}", b.name)),
+                ),
+            }
+        }
+
+        // Phase 3: the per-branch probe, against a now read-only walk table.
+        let results = parallel::map(&to_walk, jobs, |(b, fork)| {
+            let outcome = match fork.as_ref() {
+                Ok(Some(mb)) => match walks.get(mb.as_str()) {
+                    Some(ids) => probe_branch(git, &b.sha, mb, ids),
+                    None => Ok(None), // its walk failed; already warned above
+                },
+                Ok(None) => Ok(None), // no common history
+                Err(e) => Err(anyhow::anyhow!("{e:#}")),
+            };
+            tick();
+            outcome
+        });
+
+        for ((b, fork), result) in to_walk.iter().zip(results) {
+            match result {
+                Ok(verdict) => {
+                    if let Some(kind) = verdict {
+                        probed.insert(b.refname.as_str(), kind);
+                    }
+                    // Only a verdict computed against a known fork point can
+                    // be keyed, and only a successful walk produced one.
+                    if let Ok(Some(mb)) = fork
+                        && walks.contains_key(mb.as_str())
+                    {
+                        fresh.push((Key::new(&base.sha, mb, &b.sha), verdict));
+                    }
+                }
+                // One odd branch must not abort the whole scan.
+                Err(e) => warnings.push(format!("{}: merge probe failed: {e:#}", b.name)),
+            }
+        }
+    }
+
+    for (key, verdict) in fresh {
+        cache.insert(key, verdict);
+    }
+
+    let mut candidates = Vec::new();
+    for b in &examinable {
         let kind = if merged.contains(&b.refname) {
             MergeKind::Merged
         } else {
-            let probed = if shallow {
-                None
-            } else {
-                // One odd branch must not abort the whole scan.
-                match merged_by_patch_id(git, &base, &b.refname, &mut upstream_cache) {
-                    Ok(kind) => kind,
-                    Err(e) => {
-                        warnings.push(format!("{}: merge probe failed: {e:#}", b.name));
-                        None
-                    }
-                }
-            };
-            match probed {
-                Some(kind) => kind,
+            match probed.get(b.refname.as_str()) {
+                Some(kind) => *kind,
                 None if b.upstream_gone => MergeKind::Gone,
                 None => continue,
             }
         };
-
         candidates.push(Candidate {
-            name: b.name,
-            refname: b.refname,
-            sha: b.sha,
+            name: b.name.clone(),
+            refname: b.refname.clone(),
+            sha: b.sha.clone(),
             kind,
-            upstream: b.upstream,
-            remote_name: b.remote_name,
+            upstream: b.upstream.clone(),
+            remote_name: b.remote_name.clone(),
             upstream_gone: b.upstream_gone,
             last_commit_unix: b.last_commit_unix,
-            subject: b.subject,
-            upstream_ref: b.upstream_ref,
+            subject: b.subject.clone(),
+            upstream_ref: b.upstream_ref.clone(),
         });
     }
 
+    reporter.finish();
     candidates.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
     Ok(Scan {
         base,
@@ -178,7 +316,7 @@ pub fn scan(git: &dyn Git, base_flag: Option<&str>, extra_protect: &[String]) ->
 
 fn resolve_base(git: &dyn Git, flag: Option<&str>) -> Result<Base> {
     if let Some(name) = flag {
-        let (ok, _) = git.try_run(&[
+        let (ok, sha) = git.try_run(&[
             "rev-parse",
             "--verify",
             "--quiet",
@@ -187,6 +325,7 @@ fn resolve_base(git: &dyn Git, flag: Option<&str>) -> Result<Base> {
         if !ok {
             bail!("--base {name} does not resolve to a commit");
         }
+        let sha = sha.trim().to_string();
         // --symbolic-full-name resolves symrefs to the terminal ref, so
         // `--base origin/HEAD` already yields e.g. refs/remotes/origin/main
         // and the exclusion logic protects the right branch.
@@ -195,6 +334,7 @@ fn resolve_base(git: &dyn Git, flag: Option<&str>) -> Result<Base> {
         return Ok(Base {
             name: name.to_string(),
             refname: (ok && !full.is_empty()).then_some(full),
+            sha,
         });
     }
     let (ok, out) = git.try_run(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])?;
@@ -202,7 +342,7 @@ fn resolve_base(git: &dyn Git, flag: Option<&str>) -> Result<Base> {
         // The symref can dangle (e.g. a clone from before a master→main
         // rename); only trust it when the target still resolves.
         let full = out.trim().to_string();
-        let (ok, _) = git.try_run(&[
+        let (ok, sha) = git.try_run(&[
             "rev-parse",
             "--verify",
             "--quiet",
@@ -212,6 +352,7 @@ fn resolve_base(git: &dyn Git, flag: Option<&str>) -> Result<Base> {
             return Ok(Base {
                 name: rest.to_string(),
                 refname: Some(full),
+                sha: sha.trim().to_string(),
             });
         }
     }
@@ -221,7 +362,7 @@ fn resolve_base(git: &dyn Git, flag: Option<&str>) -> Result<Base> {
         ("main", "refs/heads/main"),
         ("master", "refs/heads/master"),
     ] {
-        let (ok, _) = git.try_run(&[
+        let (ok, sha) = git.try_run(&[
             "rev-parse",
             "--verify",
             "--quiet",
@@ -231,6 +372,7 @@ fn resolve_base(git: &dyn Git, flag: Option<&str>) -> Result<Base> {
             return Ok(Base {
                 name: name.to_string(),
                 refname: Some(full.to_string()),
+                sha: sha.trim().to_string(),
             });
         }
     }
@@ -342,33 +484,40 @@ fn with_diff_flags(prefix: &[&str], range: &str) -> Vec<String> {
         .collect()
 }
 
+/// The fork point of `branch_ref` from the base, or None when they share no
+/// history at all.
+fn merge_base(git: &dyn Git, base: &Base, branch_sha: &str) -> Result<Option<String>> {
+    let (ok, out) = git.try_run(&["merge-base", &base.sha, branch_sha])?;
+    Ok(ok.then(|| out.trim().to_string()))
+}
+
+/// Patch-ids of everything the base gained since `merge_base`. This is the
+/// expensive half of squash/rebase detection, and every branch cut from the
+/// same fork point shares one walk — hence computing it per distinct fork
+/// point rather than per branch.
+fn upstream_patch_ids(git: &dyn Git, base: &Base, merge_base: &str) -> Result<HashSet<String>> {
+    let args = with_diff_flags(
+        &["log", "-p", "--no-merges"],
+        &format!("{merge_base}..{}", base.sha),
+    );
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    Ok(patch_ids(git, &git.run(&refs)?)?.into_iter().collect())
+}
+
 /// Patch-id detection for merges that rewrite history. Pure reads — no
 /// objects are written, so listing works on read-only repositories.
-/// `upstream_cache` memoizes the (expensive) upstream patch-id walk per
-/// merge-base: branches forked from the same point share one walk.
-fn merged_by_patch_id(
+///
+/// Takes the branch's SHA, never its ref: the verdict is cached under that
+/// sha, so measuring anything else would store an answer about a commit the
+/// key does not name. A branch moved by another terminal mid-scan and then
+/// restored would otherwise be force-deleted on the strength of a verdict
+/// computed for different commits.
+fn probe_branch(
     git: &dyn Git,
-    base: &Base,
-    branch_ref: &str,
-    upstream_cache: &mut HashMap<String, HashSet<String>>,
+    branch_sha: &str,
+    merge_base: &str,
+    upstream_ids: &HashSet<String>,
 ) -> Result<Option<MergeKind>> {
-    let (ok, merge_base) = git.try_run(&["merge-base", base.rev(), branch_ref])?;
-    if !ok {
-        return Ok(None); // no common history
-    }
-    let merge_base = merge_base.trim().to_string();
-
-    // Patches base gained since the fork point.
-    if !upstream_cache.contains_key(&merge_base) {
-        let args = with_diff_flags(
-            &["log", "-p", "--no-merges"],
-            &format!("{merge_base}..{}", base.rev()),
-        );
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let ids = patch_ids(git, &git.run(&refs)?)?.into_iter().collect();
-        upstream_cache.insert(merge_base.clone(), ids);
-    }
-    let upstream_ids = &upstream_cache[&merge_base];
     if upstream_ids.is_empty() {
         return Ok(None);
     }
@@ -377,7 +526,7 @@ fn merged_by_patch_id(
     // GitHub's "Squash and merge" lands on base.
     let mut args = vec!["diff-tree".to_string(), "-p".to_string(), "-r".to_string()];
     args.extend(DIFF_FLAGS.iter().map(|s| s.to_string()));
-    args.extend([merge_base.clone(), branch_ref.to_string()]);
+    args.extend([merge_base.to_string(), branch_sha.to_string()]);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let combined = git.run(&refs)?;
     if let Some(id) = patch_ids(git, &combined)?.first()
@@ -393,14 +542,14 @@ fn merged_by_patch_id(
         "rev-list",
         "--min-parents=2",
         "--count",
-        &format!("{merge_base}..{branch_ref}"),
+        &format!("{merge_base}..{branch_sha}"),
     ])?;
     if merges.trim() != "0" {
         return Ok(None);
     }
     let args = with_diff_flags(
         &["log", "-p", "--no-merges"],
-        &format!("{merge_base}..{branch_ref}"),
+        &format!("{merge_base}..{branch_sha}"),
     );
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let branch_ids = patch_ids(git, &git.run(&refs)?)?;
@@ -412,7 +561,7 @@ fn merged_by_patch_id(
             "rev-list",
             "--no-merges",
             "--count",
-            &format!("{merge_base}..{branch_ref}"),
+            &format!("{merge_base}..{branch_sha}"),
         ])?
         .trim()
         .parse()
@@ -481,6 +630,394 @@ impl RawBranch {
 mod tests {
     use super::*;
     use crate::git::fake::FakeGit;
+    use crate::progress::Reporter;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        ticks: Mutex<Vec<(usize, usize)>>,
+        finished: AtomicBool,
+    }
+
+    impl Reporter for RecordingReporter {
+        fn tick(&self, done: usize, total: usize) {
+            self.ticks.lock().unwrap().push((done, total));
+        }
+        fn finish(&self) {
+            self.finished.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A repository with `main` as origin/HEAD and two ancestry-merged
+    /// branches, so the scan never reaches the patch-id probes.
+    fn two_merged_branches() -> FakeGit {
+        let format = FORMAT;
+        FakeGit::default()
+            .on(
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                Ok("refs/remotes/origin/main\n"),
+            )
+            .on(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/remotes/origin/main^{commit}",
+                ],
+                Ok("base000\n"),
+            )
+            .on(&["symbolic-ref", "--quiet", "--short", "HEAD"], Ok("main\n"))
+            .on(&["config", "--get-all", "barber.protect"], Err(""))
+            .on(&["rev-parse", "--is-shallow-repository"], Ok("false\n"))
+            .on(&["worktree", "list", "--porcelain"], Ok("branch refs/heads/main\n"))
+            .on(
+                &[
+                    "for-each-ref",
+                    "refs/heads",
+                    "--merged",
+                    "base000",
+                    "--format=%(refname)",
+                ],
+                Ok("refs/heads/feat-a\nrefs/heads/feat-b\n"),
+            )
+            .on(&["remote"], Ok("origin\n"))
+            .on(
+                &["for-each-ref", "refs/heads", format],
+                Ok("refs/heads/feat-a\u{0}aaa111\u{0}refs/remotes/origin/feat-a\u{0}origin/feat-a\u{0}\u{0}origin\u{0}1700000000\u{0}add a\n\
+                    refs/heads/feat-b\u{0}bbb222\u{0}\u{0}\u{0}\u{0}\u{0}1700000100\u{0}add b\n"),
+            )
+    }
+
+    /// Everything a scan needs up to and including the fork point, for one
+    /// unmerged branch. Deliberately cans NO probe commands: `FakeGit` bails
+    /// on unexpected argv, so any test using this fails loudly the moment a
+    /// probe runs.
+    fn up_to_the_fork_point() -> FakeGit {
+        FakeGit::default()
+            .on(
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                Ok("refs/remotes/origin/main\n"),
+            )
+            .on(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/remotes/origin/main^{commit}",
+                ],
+                Ok("basesha0\n"),
+            )
+            .on(
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                Ok("main\n"),
+            )
+            .on(&["config", "--get-all", "barber.protect"], Err(""))
+            .on(&["rev-parse", "--is-shallow-repository"], Ok("false\n"))
+            .on(
+                &["worktree", "list", "--porcelain"],
+                Ok("branch refs/heads/main\n"),
+            )
+            .on(
+                &[
+                    "for-each-ref",
+                    "refs/heads",
+                    "--merged",
+                    "basesha0",
+                    "--format=%(refname)",
+                ],
+                Ok("\n"),
+            )
+            .on(&["remote"], Ok("origin\n"))
+            .on(
+                &["for-each-ref", "refs/heads", FORMAT],
+                Ok("refs/heads/feat\u{0}feat111\u{0}\u{0}\u{0}\u{0}\u{0}1700000000\u{0}work\n"),
+            )
+            .on(&["merge-base", "basesha0", "feat111"], Ok("mb0\n"))
+    }
+
+    fn one_branch_options() -> Options<'static> {
+        Options {
+            base: None,
+            protect: &[],
+            jobs: 1,
+        }
+    }
+
+    #[test]
+    fn a_cached_verdict_is_used_instead_of_probing_again() {
+        // The whole point of the cache, and the only test that proves it is
+        // READ at all: no probe command is canned here, so if the scan falls
+        // through to the prober FakeGit refuses the call and the branch stops
+        // being a squash candidate.
+        let git = up_to_the_fork_point();
+        let mut cache = Cache::default();
+        cache.insert(
+            Key::new("basesha0", "mb0", "feat111"),
+            Some(MergeKind::Squash),
+        );
+
+        let scan = scan(
+            &git,
+            &one_branch_options(),
+            &crate::progress::NullReporter,
+            &mut cache,
+        )
+        .unwrap();
+
+        assert!(scan.warnings.is_empty(), "unexpected: {:?}", scan.warnings);
+        assert_eq!(
+            scan.candidates
+                .iter()
+                .map(|c| (c.name.as_str(), c.kind))
+                .collect::<Vec<_>>(),
+            vec![("feat", MergeKind::Squash)],
+        );
+    }
+
+    #[test]
+    fn a_verdict_cached_for_a_different_tip_is_never_reused() {
+        // Same branch name, same fork point, different branch tip. Serving
+        // the old verdict here would force-delete commits nothing verified,
+        // so the scan must go back to the prober — which FakeGit refuses,
+        // turning the reuse into a loud failure rather than a silent delete.
+        let git = up_to_the_fork_point();
+        let mut cache = Cache::default();
+        cache.insert(
+            Key::new("basesha0", "mb0", "OLD-TIP"),
+            Some(MergeKind::Squash),
+        );
+
+        let scan = scan(
+            &git,
+            &one_branch_options(),
+            &crate::progress::NullReporter,
+            &mut cache,
+        )
+        .unwrap();
+
+        assert!(
+            scan.candidates.is_empty(),
+            "a stale verdict was reused: {:?}",
+            scan.candidates
+                .iter()
+                .map(|c| (c.name.as_str(), c.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            scan.warnings.iter().any(|w| w.contains("feat")),
+            "the prober should have been consulted, got {:?}",
+            scan.warnings
+        );
+    }
+
+    #[test]
+    fn every_probe_is_pinned_to_the_shas_resolved_at_scan_start() {
+        // The cache key records the base tip and the branch tip captured at
+        // scan start. If any probe asked git for a REF instead, whatever the
+        // ref pointed at seconds later would be judged, and the verdict
+        // stored under the sha that was NOT measured:
+        //
+        //   * base side — a fetch lands mid-scan, then a later rewind serves
+        //     the verdict as a hit;
+        //   * branch side — a rebase in another terminal moves the branch,
+        //     then `git rebase --abort` puts it back.
+        //
+        // Either way compare-then-delete cannot catch it: by deletion time
+        // the tip does equal the sha, so the branch is force-deleted with
+        // work nothing ever verified. Pinning every command to a sha closes
+        // both, and removes the intra-run inconsistency the parallel phases
+        // widened.
+        //
+        // FakeGit rejects any argv it was not given, so canning ONLY the sha
+        // form is what pins this.
+        const SHA: &str = "basesha0";
+        const BRANCH: &str = "feat111";
+        fn log_args(range: &str) -> Vec<&str> {
+            let mut v = vec!["log", "-p", "--no-merges"];
+            v.extend_from_slice(&DIFF_FLAGS);
+            v.push(range);
+            v
+        }
+        fn diff_tree_args<'a>(mb: &'a str, branch_ref: &'a str) -> Vec<&'a str> {
+            let mut v = vec!["diff-tree", "-p", "-r"];
+            v.extend_from_slice(&DIFF_FLAGS);
+            v.extend([mb, branch_ref]);
+            v
+        }
+
+        let git = FakeGit::default()
+            .on(
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                Ok("refs/remotes/origin/main\n"),
+            )
+            .on(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/remotes/origin/main^{commit}",
+                ],
+                Ok("basesha0\n"),
+            )
+            .on(
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                Ok("main\n"),
+            )
+            .on(&["config", "--get-all", "barber.protect"], Err(""))
+            .on(&["rev-parse", "--is-shallow-repository"], Ok("false\n"))
+            .on(
+                &["worktree", "list", "--porcelain"],
+                Ok("branch refs/heads/main\n"),
+            )
+            // Ancestry, fork point and upstream walk: all keyed to the sha.
+            .on(
+                &[
+                    "for-each-ref",
+                    "refs/heads",
+                    "--merged",
+                    SHA,
+                    "--format=%(refname)",
+                ],
+                Ok("\n"),
+            )
+            .on(&["remote"], Ok("origin\n"))
+            .on(
+                &["for-each-ref", "refs/heads", FORMAT],
+                Ok("refs/heads/feat\u{0}feat111\u{0}\u{0}\u{0}\u{0}\u{0}1700000000\u{0}work\n"),
+            )
+            .on(&["merge-base", SHA, BRANCH], Ok("mb0\n"))
+            .on(&log_args(&format!("mb0..{SHA}")), Ok("UPLOG"))
+            .on_input(&["patch-id", "--stable"], "UPLOG", Ok("shared1 c1\n"))
+            .on(&diff_tree_args("mb0", BRANCH), Ok("DIFF"))
+            .on_input(&["patch-id", "--stable"], "DIFF", Ok("shared1 000\n"));
+
+        let scan = scan(
+            &git,
+            &Options {
+                base: None,
+                protect: &[],
+                jobs: 1,
+            },
+            &crate::progress::NullReporter,
+            &mut Cache::default(),
+        )
+        .unwrap();
+        assert_eq!(scan.base.sha, SHA);
+        assert_eq!(
+            scan.candidates
+                .iter()
+                .map(|c| (c.name.as_str(), c.kind))
+                .collect::<Vec<_>>(),
+            vec![("feat", MergeKind::Squash)]
+        );
+    }
+
+    #[test]
+    fn a_shallow_repository_still_counts_every_branch_it_examined() {
+        // Shallow clones disable the patch-id probes entirely, so nothing
+        // reaches phase 3. The counter must not stop short of the total and
+        // leave the scan looking aborted.
+        let git = FakeGit::default()
+            .on(
+                &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+                Ok("refs/remotes/origin/main\n"),
+            )
+            .on(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/remotes/origin/main^{commit}",
+                ],
+                Ok("base000\n"),
+            )
+            .on(
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+                Ok("main\n"),
+            )
+            .on(&["config", "--get-all", "barber.protect"], Err(""))
+            .on(&["rev-parse", "--is-shallow-repository"], Ok("true\n"))
+            .on(
+                &["worktree", "list", "--porcelain"],
+                Ok("branch refs/heads/main\n"),
+            )
+            .on(
+                &[
+                    "for-each-ref",
+                    "refs/heads",
+                    "--merged",
+                    "base000",
+                    "--format=%(refname)",
+                ],
+                Ok("refs/heads/feat-a\n"),
+            )
+            .on(&["remote"], Ok("origin\n"))
+            .on(
+                &["for-each-ref", "refs/heads", FORMAT],
+                Ok(
+                    "refs/heads/feat-a\u{0}aaa111\u{0}\u{0}\u{0}\u{0}\u{0}1700000000\u{0}a\n\
+                    refs/heads/feat-b\u{0}bbb222\u{0}\u{0}\u{0}\u{0}\u{0}1700000100\u{0}b\n",
+                ),
+            );
+
+        let reporter = RecordingReporter::default();
+        let scan = scan(
+            &git,
+            &Options {
+                base: None,
+                protect: &[],
+                jobs: 1,
+            },
+            &reporter,
+            &mut Cache::default(),
+        )
+        .unwrap();
+
+        assert!(
+            scan.warnings.iter().any(|w| w.contains("shallow")),
+            "expected the shallow warning, got {:?}",
+            scan.warnings
+        );
+        let ticks = reporter.ticks.lock().unwrap().clone();
+        assert_eq!(
+            ticks.last(),
+            Some(&(2, 2)),
+            "the counter must reach the total, got {ticks:?}"
+        );
+    }
+
+    #[test]
+    fn scan_reports_progress_for_every_branch_and_clears_the_line() {
+        // Silence during a long scan reads as a hang: every branch examined
+        // has to move the counter, and the line must be wiped afterwards so
+        // it cannot collide with the listing.
+        let git = two_merged_branches();
+        let reporter = RecordingReporter::default();
+        let scan = scan(
+            &git,
+            &Options {
+                base: None,
+                protect: &[],
+                jobs: 1,
+            },
+            &reporter,
+            &mut Cache::default(),
+        )
+        .unwrap();
+
+        assert_eq!(scan.candidates.len(), 2);
+        let ticks = reporter.ticks.lock().unwrap().clone();
+        assert_eq!(ticks.len(), 2, "one tick per branch, got {ticks:?}");
+        assert!(
+            ticks.iter().all(|&(_, total)| total == 2),
+            "total must be the branch count, got {ticks:?}"
+        );
+        assert!(
+            reporter.finished.load(Ordering::SeqCst),
+            "finish not called"
+        );
+    }
 
     #[test]
     fn base_flag_is_verified_and_normalized() {
@@ -676,17 +1213,21 @@ mod tests {
             v.extend([mb, branch_ref]);
             v
         }
-        const BASE_REV: &str = "refs/remotes/origin/main";
+        // Scan queries are pinned to the resolved base SHA, not the ref —
+        // see `every_probe_is_pinned_to_the_shas_resolved_at_scan_start`.
+        const BASE_REV: &str = "abc";
 
+        // Every probe argument is a SHA, never a ref — both the base and the
+        // branch. That is what the cache keys name.
         let probe = |git: FakeGit,
                      branch: &str,
+                     branch_sha: &str,
                      mb: &str,
                      combined_id: &str,
                      branch_ids: &str,
                      branch_commits: &str| {
-            let branch_ref = format!("refs/heads/{branch}");
             git.on(
-                &["merge-base", BASE_REV, &branch_ref],
+                &["merge-base", BASE_REV, branch_sha],
                 Ok(&format!("{mb}\n")),
             )
             .on(
@@ -699,7 +1240,7 @@ mod tests {
                 Ok("up1 c1\nup2 c2\n"),
             )
             .on(
-                &diff_tree_args(mb, &branch_ref),
+                &diff_tree_args(mb, branch_sha),
                 Ok(&format!("DIFF-{branch}")),
             )
             .on_input(
@@ -712,12 +1253,12 @@ mod tests {
                     "rev-list",
                     "--min-parents=2",
                     "--count",
-                    &format!("{mb}..{branch_ref}"),
+                    &format!("{mb}..{branch_sha}"),
                 ],
                 Ok("0\n"),
             )
             .on(
-                &log_args(&format!("{mb}..{branch_ref}")),
+                &log_args(&format!("{mb}..{branch_sha}")),
                 Ok(&format!("BLOG-{branch}")),
             )
             .on_input(
@@ -730,7 +1271,7 @@ mod tests {
                     "rev-list",
                     "--no-merges",
                     "--count",
-                    &format!("{mb}..{branch_ref}"),
+                    &format!("{mb}..{branch_sha}"),
                 ],
                 Ok(branch_commits),
             )
@@ -777,14 +1318,40 @@ mod tests {
                 Ok(&enumeration),
             );
         // squash: combined diff id matches upstream; rebase check not reached
-        git = probe(git, "feature-squash", "mb2", "up1", "irrelevant 0\n", "9");
+        git = probe(
+            git,
+            "feature-squash",
+            "s2",
+            "mb2",
+            "up1",
+            "irrelevant 0\n",
+            "9",
+        );
         // rebase: combined misses, but each commit's id is upstream and the
         // id count equals the commit count (no empty commits hiding)
-        git = probe(git, "feature-rebase", "mb3", "zzz", "up1 a\nup2 b\n", "2\n");
+        git = probe(
+            git,
+            "feature-rebase",
+            "s3",
+            "mb3",
+            "zzz",
+            "up1 a\nup2 b\n",
+            "2\n",
+        );
         // gone: nothing matches
-        git = probe(git, "feature-gone", "mb4", "zzz", "own1 a\n", "1\n");
+        git = probe(git, "feature-gone", "s4", "mb4", "zzz", "own1 a\n", "1\n");
 
-        let scan = scan(&git, None, &["release/*".to_string()]).unwrap();
+        let scan = scan(
+            &git,
+            &Options {
+                base: None,
+                protect: &["release/*".to_string()],
+                jobs: 1,
+            },
+            &crate::progress::NullReporter,
+            &mut Cache::default(),
+        )
+        .unwrap();
         assert_eq!(scan.base.name, "origin/main");
         let kinds: Vec<(&str, MergeKind)> = scan
             .candidates
@@ -839,12 +1406,14 @@ mod tests {
             .on(&["rev-parse", "--is-shallow-repository"], Ok("false\n"))
             .on(&["worktree", "list", "--porcelain"], Ok(""))
             .on(&["remote"], Ok("origin\n"))
+            // Pinned to the resolved base SHA, not the ref — see
+            // `every_probe_is_pinned_to_the_base_sha_resolved_at_scan_start`.
             .on(
                 &[
                     "for-each-ref",
                     "refs/heads",
                     "--merged",
-                    "refs/remotes/origin/main",
+                    "abc",
                     "--format=%(refname)",
                 ],
                 Ok(""),
@@ -853,26 +1422,29 @@ mod tests {
                 &["for-each-ref", "refs/heads", super::FORMAT],
                 Ok(&enumeration),
             )
-            .on(
-                &[
-                    "merge-base",
-                    "refs/remotes/origin/main",
-                    "refs/heads/feature-odd",
-                ],
-                Ok("mb\n"),
-            )
+            .on(&["merge-base", "abc", "refs/heads/feature-odd"], Ok("mb\n"))
             // upstream log blows up (e.g. corrupt object) — scan must survive
             .on(
                 &{
                     let mut v = vec!["log", "-p", "--no-merges"];
                     v.extend_from_slice(&super::DIFF_FLAGS);
-                    v.push("mb..refs/remotes/origin/main");
+                    v.push("mb..abc");
                     v
                 },
                 Err("boom"),
             );
 
-        let scan = scan(&git, None, &[]).unwrap();
+        let scan = scan(
+            &git,
+            &Options {
+                base: None,
+                protect: &[],
+                jobs: 1,
+            },
+            &crate::progress::NullReporter,
+            &mut Cache::default(),
+        )
+        .unwrap();
         assert!(scan.candidates.is_empty());
         assert!(
             scan.warnings.iter().any(|w| w.contains("feature-odd")),

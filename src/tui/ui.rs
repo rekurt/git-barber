@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::ops::{self, LocalOutcome, RemoteOutcome};
 use crate::output::kind_label;
@@ -10,6 +10,11 @@ use crate::scan::MergeKind;
 use crate::tui::app::{App, Screen};
 
 const MAX_NAME_W: usize = 40;
+/// Below this the terminal is too narrow to split side by side without
+/// squeezing the branch list, so the preview goes underneath instead.
+const PREVIEW_SIDE_BY_SIDE_W: u16 = 100;
+/// Rows the preview gets when it sits under the list.
+const PREVIEW_BOTTOM_H: u16 = 10;
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const RED: Style = Style::new().fg(Color::Red);
 const YELLOW: Style = Style::new().fg(Color::Yellow);
@@ -44,9 +49,45 @@ fn clip(name: &str, max: usize) -> String {
     }
 }
 
+/// Split the body into the list and, when the panel is open, the preview.
+/// `Min` on the list side means a short or narrow terminal shrinks the
+/// preview rather than the thing being chosen from.
+fn split_body(area: Rect, preview_open: bool) -> (Rect, Option<Rect>) {
+    if !preview_open {
+        return (area, None);
+    }
+    if area.width >= PREVIEW_SIDE_BY_SIDE_W {
+        let [list, preview] =
+            Layout::horizontal([Constraint::Min(40), Constraint::Percentage(45)]).areas(area);
+        (list, Some(preview))
+    } else {
+        let [list, preview] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(PREVIEW_BOTTOM_H)])
+                .areas(area);
+        (list, Some(preview))
+    }
+}
+
+fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
+    let name = app
+        .highlighted_candidate()
+        .map(|c| c.name.as_str())
+        .unwrap_or("");
+    // No text yet means the driver has not answered for this branch: say so
+    // rather than showing a blank box that reads as "nothing here".
+    let text = app.preview().unwrap_or("loading…");
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::bordered().title(format!(" {} ", clip(name, MAX_NAME_W))))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_list(frame: &mut Frame, app: &mut App) {
-    let [main, footer] =
+    let [body, footer] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+    let (main, preview) = split_body(body, app.preview_open);
 
     let name_w = app
         .items
@@ -110,8 +151,12 @@ fn render_list(frame: &mut Frame, app: &mut App) {
     app.list_state.select(Some(app.cursor));
     frame.render_stateful_widget(list, main, &mut app.list_state);
 
+    if let Some(area) = preview {
+        render_preview(frame, app, area);
+    }
+
     let hint = format!(
-        " {} sel · {} force · {} remote │ space a n r · enter delete · q quit",
+        " {} sel · {} force · {} remote │ space a n r p · enter delete · q quit",
         app.selected_count(),
         app.force_count(),
         app.remote_count(),
@@ -337,6 +382,7 @@ mod tests {
             base: Base {
                 name: "origin/main".into(),
                 refname: Some("refs/remotes/origin/main".into()),
+                sha: "base000".into(),
             },
             candidates: vec![
                 candidate("merged-a", MergeKind::Merged),
@@ -344,7 +390,7 @@ mod tests {
             ],
             warnings: vec!["shallow repository: probes disabled".into()],
         };
-        App::new(scan, false, 86_400)
+        App::new(scan, false, 86_400, false)
     }
 
     fn screen_text(app: &mut App) -> String {
@@ -422,5 +468,38 @@ mod tests {
             text.contains('…'),
             "long names must be clipped with an ellipsis"
         );
+    }
+    #[test]
+    fn a_wide_terminal_puts_the_preview_beside_the_list() {
+        let (list, preview) = split_body(Rect::new(0, 0, 120, 30), true);
+        let preview = preview.expect("an open panel must get an area");
+        assert_eq!(list.y, preview.y, "expected a side-by-side split");
+        assert!(preview.x >= list.x + list.width, "panes must not overlap");
+    }
+
+    #[test]
+    fn a_narrow_terminal_stacks_the_preview_under_the_list() {
+        // Side by side under ~100 columns would squeeze branch names to
+        // nothing, which is worse than losing rows.
+        let (list, preview) = split_body(Rect::new(0, 0, 80, 30), true);
+        let preview = preview.expect("an open panel must get an area");
+        assert_eq!(list.x, preview.x, "expected a stacked split");
+        assert!(preview.y >= list.y + list.height, "panes must not overlap");
+    }
+
+    #[test]
+    fn a_closed_panel_gives_the_whole_body_to_the_list() {
+        let area = Rect::new(0, 0, 120, 30);
+        let (list, preview) = split_body(area, false);
+        assert_eq!(list, area);
+        assert!(preview.is_none());
+    }
+
+    #[test]
+    fn a_short_terminal_shrinks_the_preview_rather_than_the_list() {
+        // The list is what the user is choosing from; it must never collapse
+        // to nothing just because the panel wants ten rows.
+        let (list, _) = split_body(Rect::new(0, 0, 80, 6), true);
+        assert!(list.height >= 3, "list collapsed to {} rows", list.height);
     }
 }
