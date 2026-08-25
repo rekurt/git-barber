@@ -1,6 +1,7 @@
 mod app;
 mod ui;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
@@ -8,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use crate::git::Git;
+use crate::git::{Git, SystemGit};
 use crate::ops;
 use crate::scan::{Base, Scan};
 use app::{Action, App};
@@ -21,6 +22,7 @@ pub fn run(
     preselect_remote: bool,
     now_unix: i64,
     preview_open: bool,
+    repo_dir: Option<PathBuf>,
 ) -> Result<ExitCode> {
     let mut app = App::new(scan, preselect_remote, now_unix, preview_open);
     let mut terminal = match ratatui::try_init() {
@@ -32,7 +34,7 @@ pub fn run(
             return Err(err.into());
         }
     };
-    let result = event_loop(&mut terminal, &mut app, git);
+    let result = event_loop(&mut terminal, &mut app, git, repo_dir);
     ratatui::restore();
     // The alternate screen is gone the moment we restore — replay the
     // outcomes (and their undo commands) onto the real terminal so they
@@ -98,35 +100,39 @@ fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     git: &dyn Git,
+    repo_dir: Option<PathBuf>,
 ) -> Result<ExitCode> {
     // Previews run on their own thread. Fetching them inline would put two
     // git subprocesses between the draw and the next `event::poll`, so every
     // move onto an unseen branch would freeze input until they finished —
     // exactly the lag the panel is supposed to avoid.
-    std::thread::scope(|scope| {
-        let (want_tx, want_rx) = channel::<(String, String)>();
-        let (done_tx, done_rx) = channel::<(String, String)>();
-        let base = app.base.clone();
-        scope.spawn(move || {
-            while let Ok(oldest) = want_rx.recv() {
-                // Serve the NEWEST request, not the oldest. Scrolling through
-                // a long list queues one per branch passed, and answering
-                // them in order would leave the branch actually being looked
-                // at until last. Anything skipped is simply re-requested if
-                // the cursor comes back to it.
-                let (name, branch_ref) = want_rx.try_iter().last().unwrap_or(oldest);
-                let text = preview_text(git, &base, &branch_ref);
-                if done_tx.send((name, text)).is_err() {
-                    return;
-                }
+    //
+    // The thread is DETACHED, not scoped. A scope joins on the way out, and a
+    // `q` pressed while a preview is mid-flight would then sit on the frozen
+    // alternate screen until both git commands finished — measurably as long
+    // as the preview itself takes. Quitting has to be immediate, so the
+    // worker owns everything it needs (hence its own `SystemGit` rather than
+    // a borrow) and is simply abandoned at exit. Its git children are
+    // read-only and get reaped by init.
+    let (want_tx, want_rx) = channel::<(String, String)>();
+    let (done_tx, done_rx) = channel::<(String, String)>();
+    let base = app.base.clone();
+    std::thread::spawn(move || {
+        let git = SystemGit::new(repo_dir);
+        while let Ok(oldest) = want_rx.recv() {
+            // Serve the NEWEST request, not the oldest. Scrolling through a
+            // long list queues one per branch passed, and answering them in
+            // order would leave the branch actually being looked at until
+            // last. Anything skipped is simply re-requested if the cursor
+            // comes back to it.
+            let (name, branch_ref) = want_rx.try_iter().last().unwrap_or(oldest);
+            let text = preview_text(&git, &base, &branch_ref);
+            if done_tx.send((name, text)).is_err() {
+                return;
             }
-        });
-        let outcome = drive(terminal, app, &want_tx, &done_rx, git);
-        // Closing the request channel ends the worker, which is what lets
-        // this scope join instead of hanging on exit.
-        drop(want_tx);
-        outcome
-    })
+        }
+    });
+    drive(terminal, app, &want_tx, &done_rx, git)
 }
 
 fn drive(

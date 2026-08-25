@@ -152,7 +152,14 @@ fn run(cli: &Cli, mode: Mode) -> anyhow::Result<ExitCode> {
                 print!("{}", output::human_list(&scan, now_unix()));
                 return Ok(ExitCode::SUCCESS);
             }
-            tui::run(&git, scan, cli.remote, now_unix(), config::preview(&git))
+            tui::run(
+                &git,
+                scan,
+                cli.remote,
+                now_unix(),
+                config::preview(&git),
+                cli.dir.clone(),
+            )
         }
     }
 }
