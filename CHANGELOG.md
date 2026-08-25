@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-26
+
 ### Added
 
 - Prebuilt binaries for macOS (arm64, x86_64), Linux (arm64, x86_64, musl) and
@@ -53,5 +55,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`--force-with-lease`) strictly opt-in, undo command printed for every
   deletion.
 
-[Unreleased]: https://github.com/rekurt/git-barber/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rekurt/git-barber/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rekurt/git-barber/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rekurt/git-barber/releases/tag/v0.1.0
