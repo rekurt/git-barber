@@ -6,7 +6,10 @@ use anyhow::{Context, Result, bail};
 
 /// Minimal seam over the `git` binary. Everything the tool learns about a
 /// repository flows through this trait, so tests can substitute a fake.
-pub trait Git {
+///
+/// `Sync` because the scan probes branches from several worker threads; every
+/// implementation is read-only shared state, so this costs nothing.
+pub trait Git: Sync {
     /// Run git with `args`; returns stdout on exit code 0, error otherwise.
     fn run(&self, args: &[&str]) -> Result<String>;
 

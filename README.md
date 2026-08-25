@@ -14,12 +14,53 @@ too, with a lease so nobody's fresh commits are ever swept away.
 
 ## Install
 
+From 0.2.0 onwards, Homebrew (macOS and Linux):
+
+```bash
+brew install rekurt/tap/git-barber
+```
+
+Or a prebuilt binary, no Rust toolchain needed — grab the archive for your
+platform from the
+[latest release](https://github.com/rekurt/git-barber/releases/latest) and put
+`git-barber` on your `PATH`. Archives also ship the completions and the man
+page.
+
+With an existing Rust setup, `cargo binstall` downloads the same prebuilt
+binary instead of compiling:
+
+```bash
+cargo binstall git-barber
+```
+
+Or build from source:
+
 ```bash
 cargo install git-barber
 ```
 
 The binary is named `git-barber`, so git picks it up as a subcommand: run it
 as `git barber`.
+
+### Shell completions
+
+Homebrew installs completions and the man page for you. Otherwise generate
+them yourself — for zsh:
+
+```bash
+mkdir -p ~/.zfunc && git-barber --completions zsh > ~/.zfunc/_git-barber
+```
+
+then, in `.zshrc` before `compinit` runs:
+
+```bash
+fpath+=~/.zfunc
+autoload -U compinit && compinit
+```
+
+`bash`, `zsh`, `fish`, `powershell` and `elvish` are supported. Completions
+register against the `git-barber` executable — as `git barber`, git drives its
+own completion machinery instead.
 
 ## Usage
 
@@ -53,8 +94,17 @@ The base branch is `origin/HEAD` when set, then `origin/main`,
 
 `j`/`k`/arrows move · `g`/`G` top/bottom · `space` toggle · `a` all ·
 `n` none · `r` arm remote deletion for the highlighted branch ·
+`p` show/hide the preview panel ·
 `enter` confirm · in the dialog `y` executes, `n`/`q`/`esc` cancel ·
 `q`/`Ctrl+C` quit.
+
+The preview panel shows the commits the highlighted branch carries that the
+base does not, plus its diffstat — so you can see what a deletion would
+actually cost before confirming it. It sits beside the list on terminals 100
+columns or wider and underneath on narrower ones, loads lazily as the cursor
+moves, and remembers what it has already fetched. Turn it off with
+`git config barber.preview false`.
+
 On the results screen `j`/`k` scroll; the full report (with undo commands)
 is reprinted to the normal terminal after exit, so nothing is lost with the
 alternate screen. Deletions run synchronously; the title shows the branch
@@ -73,6 +123,8 @@ in flight.
 | `--protect <P>`  | extra protected names/globs, e.g. `--protect 'release/*'`           |
 | `--fetch`        | run `git fetch --prune` first (non-fatal when offline)              |
 | `-C <PATH>`      | operate on a repository at PATH                                     |
+| `--no-cache`     | ignore and do not update the verdict cache; re-verify everything     |
+| `--completions <SHELL>` | print a shell completion script and exit; needs no repository |
 
 Exit codes: `0` ok / nothing to do · `1` some deletions failed · `2` usage or
 environment error.
@@ -89,6 +141,40 @@ git config --add barber.protect 'release/*'
 
 or per invocation with `--protect`. Globs support any number of `*`
 wildcards (`release/*`, `*-keep-*`).
+
+## Speed
+
+Detection is dominated by the patch-id probes, which are independent per
+branch, so the scan runs them across several workers and shows a counter on
+stderr while it works (a terminal only — piped output stays byte-for-byte
+clean). Verdicts are then cached in `.git/barber/cache.json`, keyed on the
+base tip, the fork point and the branch tip together: if any of the three
+moved, the branch is probed again rather than trusted. Only entries the last
+run actually used are written back, so the file stays the size of your branch
+list.
+
+Measured on a synthetic 200-branch repository (30 distinct fork points, every
+branch squash-merged), on an 18-core machine with git 2.50.1 — treat the
+ratios as the point, not the absolute seconds:
+
+| workers | cold  | warm cache |
+|---------|-------|------------|
+| 1       | 11.1s | —          |
+| 4       | 4.6s  | —          |
+| 8       | 3.5s  | 1.3s       |
+
+```bash
+git config barber.jobs 4   # default: CPU count, capped at 8
+```
+
+A repository you cannot write to simply pays full price every scan — the
+cache is an optimisation and never an error. To force a full re-verification,
+pass `--no-cache` or delete `.git/barber`.
+
+The cache pays off most for repeated runs against an unchanged base. When the
+base moves — after any `git fetch` that brings in new commits — every verdict
+is recomputed, because what the base gained since the fork point is exactly
+what squash and rebase detection compares against.
 
 ## Safety
 
@@ -111,6 +197,11 @@ wildcards (`release/*`, `*-keep-*`).
 - Every deletion prints an undo command
   (`git branch <name> <sha>` / `git push origin <sha>:refs/heads/<name>`),
   and the report survives the TUI (reprinted after exit).
+- **The verdict cache never widens what gets deleted.** It is keyed on the
+  base tip, the fork point and the branch tip together, and every probe is
+  pinned to those exact shas rather than to a ref that could move mid-scan.
+  Any of the three moving is a miss. `--no-cache`, or deleting `.git/barber`,
+  forces a full re-verification.
 - Scanning never touches the network unless you pass `--fetch` (remote
   *deletion*, when you ask for it, obviously pushes). Stale remote refs make
   detection more conservative and make leased remote deletion refuse —
@@ -146,7 +237,9 @@ cargo fmt --check
 
 The codebase is deliberately small: `scan.rs` (detection), `ops.rs`
 (deletion), `tui/` (pure state machine + rendering), `git.rs` (the
-subprocess seam, faked in tests). Start reading at `src/main.rs`.
+subprocess seam, faked in tests), `cache.rs` (cross-run verdict cache),
+`parallel.rs` (ordered parallel map), `progress.rs` (the scan counter) and
+`config.rs` (`git config barber.*`). Start reading at `src/main.rs`.
 
 ## License
 

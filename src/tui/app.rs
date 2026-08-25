@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 
@@ -43,10 +45,16 @@ pub struct App {
     pub results_scroll: u16,
     /// Owned by App so the list's scroll offset survives between frames.
     pub list_state: ListState,
+    /// Whether the commit-preview panel is showing.
+    pub preview_open: bool,
+    /// Rendered previews, by branch name. App never runs git itself — the
+    /// driver answers `pending_preview()` and fills these in — so the state
+    /// machine stays pure and fully unit-testable.
+    previews: HashMap<String, String>,
 }
 
 impl App {
-    pub fn new(scan: Scan, preselect_remote: bool, now_unix: i64) -> Self {
+    pub fn new(scan: Scan, preselect_remote: bool, now_unix: i64, preview_open: bool) -> Self {
         let items = scan
             .candidates
             .into_iter()
@@ -68,7 +76,41 @@ impl App {
             in_flight: None,
             results_scroll: 0,
             list_state: ListState::default(),
+            preview_open,
+            previews: HashMap::new(),
         }
+    }
+
+    /// The branch the driver should fetch a preview for, if any. None when
+    /// the panel is closed or the highlighted branch is already known, so a
+    /// closed panel costs nothing and revisiting a branch is free.
+    pub fn pending_preview(&self) -> Option<&str> {
+        if !self.preview_open {
+            return None;
+        }
+        let name = self.highlighted()?;
+        (!self.previews.contains_key(name)).then_some(name)
+    }
+
+    /// Preview text for the highlighted branch, once the driver supplied it.
+    pub fn preview(&self) -> Option<&str> {
+        self.previews.get(self.highlighted()?).map(String::as_str)
+    }
+
+    pub fn set_preview(&mut self, branch: String, text: String) {
+        self.previews.insert(branch, text);
+    }
+
+    /// The candidate under the cursor. The driver needs its refname to build
+    /// a git range; deriving both from the same cursor keeps them in step.
+    pub fn highlighted_candidate(&self) -> Option<&Candidate> {
+        self.items.get(self.cursor).map(|i| &i.candidate)
+    }
+
+    fn highlighted(&self) -> Option<&str> {
+        self.items
+            .get(self.cursor)
+            .map(|i| i.candidate.name.as_str())
     }
 
     /// Pure state transition: no I/O, no terminal. Fully unit-testable.
@@ -131,6 +173,7 @@ impl App {
                     self.screen = Screen::Confirm;
                 }
             }
+            KeyCode::Char('p') => self.preview_open = !self.preview_open,
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             _ => {}
         }
@@ -220,10 +263,15 @@ mod tests {
     }
 
     fn app() -> App {
+        app_with_preview(true)
+    }
+
+    fn app_with_preview(preview_open: bool) -> App {
         let scan = Scan {
             base: Base {
                 name: "origin/main".into(),
                 refname: Some("refs/remotes/origin/main".into()),
+                sha: "base000".into(),
             },
             candidates: vec![
                 candidate("merged-a", MergeKind::Merged),
@@ -232,7 +280,7 @@ mod tests {
             ],
             warnings: vec![],
         };
-        App::new(scan, false, 0)
+        App::new(scan, false, 0, preview_open)
     }
 
     #[test]
@@ -381,5 +429,58 @@ mod tests {
         assert!(app.update(key(KeyCode::Char('q'))).is_none());
         assert!(app.should_quit);
         assert!(app.results.is_empty());
+    }
+    #[test]
+    fn the_highlighted_branch_is_the_one_whose_preview_is_wanted() {
+        let mut app = app();
+        assert_eq!(app.pending_preview(), Some("merged-a"));
+
+        // Once the driver has answered, nothing more is wanted for it.
+        app.set_preview("merged-a".into(), "two commits".into());
+        assert_eq!(app.pending_preview(), None);
+        assert_eq!(app.preview(), Some("two commits"));
+
+        // Moving the cursor asks for the next branch instead.
+        app.update(key(KeyCode::Char('j')));
+        assert_eq!(app.pending_preview(), Some("squash-b"));
+        assert_eq!(app.preview(), None);
+    }
+
+    #[test]
+    fn a_closed_preview_panel_asks_for_nothing() {
+        // Closing the panel has to actually save the git calls, not merely
+        // hide their result.
+        let mut app = app_with_preview(false);
+        assert_eq!(app.pending_preview(), None);
+
+        app.update(key(KeyCode::Char('p')));
+        assert!(app.preview_open);
+        assert_eq!(app.pending_preview(), Some("merged-a"));
+
+        app.update(key(KeyCode::Char('p')));
+        assert!(!app.preview_open);
+        assert_eq!(app.pending_preview(), None);
+    }
+
+    #[test]
+    fn a_fetched_preview_is_remembered_when_the_cursor_comes_back() {
+        let mut app = app();
+        app.set_preview("merged-a".into(), "cached".into());
+        app.update(key(KeyCode::Char('j')));
+        app.set_preview("squash-b".into(), "other".into());
+        app.update(key(KeyCode::Char('k')));
+        assert_eq!(app.pending_preview(), None, "must not fetch twice");
+        assert_eq!(app.preview(), Some("cached"));
+    }
+
+    #[test]
+    fn p_is_inert_outside_the_list_screen() {
+        // The confirm dialog owns y/n; a stray 'p' there must not silently
+        // change what the next screen shows.
+        let mut app = app();
+        app.screen = Screen::Confirm;
+        app.update(key(KeyCode::Char('p')));
+        assert!(app.preview_open, "confirm screen must not toggle the panel");
+        assert_eq!(app.screen, Screen::Confirm);
     }
 }
