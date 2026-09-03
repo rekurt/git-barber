@@ -64,7 +64,7 @@ jobs:
             ./target/release/git-barber --completions "$shell" > "dist/completions/git-barber.$shell"
           done
           ./target/release/git-barber --man > dist/man/git-barber.1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shared-assets
           path: dist/
@@ -132,7 +132,7 @@ jobs:
               shasum -a 256 "$stage.tar.gz" | cut -d' ' -f1 > "$stage.tar.gz.sha256"
             fi
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.target }}
           path: |
