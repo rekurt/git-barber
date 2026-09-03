@@ -581,6 +581,60 @@ fn remote_flag_deletes_the_remote_counterpart_too() {
 }
 
 #[test]
+fn remote_only_merged_branch_is_listed_but_never_auto_deleted() {
+    let (_tmp, origin, dir) = repo_with_origin();
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "f.txt", "f", "feature work");
+    git(&dir, &["push", "-u", "origin", "feature"]);
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--no-ff", "feature", "-m", "merge"]);
+    git(&dir, &["push", "origin", "main"]);
+    git(&dir, &["branch", "-D", "feature"]); // simulate a prior local cleanup
+
+    let out = barber(&dir).args(["--list", "--json"]).assert().success();
+    let json: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let remote = json["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "origin/feature")
+        .expect("remote-only branch must be listed");
+    assert_eq!(remote["scope"], "remote_only");
+    assert_eq!(remote["selected_by_default"], true);
+
+    barber(&dir).args(["--yes", "--remote"]).assert().success();
+    let remote_branches = git(&origin, &["branch", "--format=%(refname:short)"]);
+    assert!(
+        remote_branches.lines().any(|b| b == "feature"),
+        "remote-only candidates require TUI selection"
+    );
+}
+
+#[test]
+fn remote_only_squash_merged_branch_is_listed() {
+    let (_tmp, _origin, dir) = repo_with_origin();
+    git(&dir, &["checkout", "-b", "feature"]);
+    commit_file(&dir, "f.txt", "f", "feature work");
+    git(&dir, &["push", "-u", "origin", "feature"]);
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--squash", "feature"]);
+    git(&dir, &["commit", "-m", "squashed feature"]);
+    git(&dir, &["push", "origin", "main"]);
+    git(&dir, &["branch", "-D", "feature"]);
+
+    let out = barber(&dir).args(["--list", "--json"]).assert().success();
+    let json: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let remote = json["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == "origin/feature")
+        .expect("squash-merged remote-only branch must be listed");
+    assert_eq!(remote["scope"], "remote_only");
+    assert_eq!(remote["kind"], "squash");
+}
+
+#[test]
 fn gentle_delete_falls_back_to_verified_force_from_another_branch() {
     let (_tmp, _origin, dir) = repo_with_origin();
     // `other` diverges from the initial commit and never sees the merge.

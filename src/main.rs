@@ -20,6 +20,7 @@ use crate::cache::Cache;
 use crate::cli::{Cli, Mode};
 use crate::git::{Git, SystemGit};
 use crate::progress::{NullReporter, Reporter, WriteReporter};
+use crate::scan::CandidateScope;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -90,6 +91,10 @@ fn run(cli: &Cli, mode: Mode) -> anyhow::Result<ExitCode> {
         base: cli.base.as_deref(),
         protect: &cli.protect,
         jobs: config::jobs(&git),
+        // Remote-only candidates are always scanned. They are preselected in
+        // the TUI but excluded from `--yes`, so they can only ever be deleted
+        // through an explicit confirmation.
+        include_remote_only: true,
     };
     let mut scan = scan::scan(&git, &options, reporter.as_ref(), &mut cache)?;
     if let Some(dir) = git_dir.as_deref() {
@@ -112,7 +117,9 @@ fn run(cli: &Cli, mode: Mode) -> anyhow::Result<ExitCode> {
                 .candidates
                 .iter()
                 .filter(|c| {
-                    c.selected_by_default() || (cli.include_gone && c.kind == scan::MergeKind::Gone)
+                    c.scope != CandidateScope::RemoteOnly
+                        && (c.selected_by_default()
+                            || (cli.include_gone && c.kind == scan::MergeKind::Gone))
                 })
                 .map(|c| ops::PlannedDeletion {
                     candidate: c.clone(),

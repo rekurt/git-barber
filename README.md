@@ -119,7 +119,7 @@ in flight.
 | `--json`         | JSON output, for scripts                                            |
 | `--yes`          | non-interactive deletion of merged + squash + rebase candidates     |
 | `--include-gone` | with `--yes`: also delete `gone` branches (requires `--yes`)        |
-| `--remote`       | also delete remote counterparts; in the TUI pre-arms the `r` toggle |
+| `--remote`       | also delete remote counterparts of local branches; pre-arms the `r` toggle |
 | `--protect <P>`  | extra protected names/globs, e.g. `--protect 'release/*'`           |
 | `--fetch`        | run `git fetch --prune` first (non-fatal when offline)              |
 | `-C <PATH>`      | operate on a repository at PATH                                     |
@@ -194,6 +194,10 @@ what squash and rebase detection compares against.
   pushed after your last fetch, the deletion is rejected. The confirm dialog
   shows the *actual* remote ref being deleted, which can differ from the
   local branch name.
+- **Remote-only cleanup is manual.** Branches that are merged into the base
+  but have no local twin always appear as preselected `remote` candidates.
+  Press `Enter` and answer `y` to delete, or `n` to leave them intact. They
+  are never removed by `--yes`.
 - Every deletion prints an undo command
   (`git branch <name> <sha>` / `git push origin <sha>:refs/heads/<name>`),
   and the report survives the TUI (reprinted after exit).
