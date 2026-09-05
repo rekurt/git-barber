@@ -10,6 +10,9 @@ already merged — including GitHub-style **squash** and **rebase** merges that
 deletes the ones you confirm. Optionally it deletes their remote counterparts
 too, with a lease so nobody's fresh commits are ever swept away.
 
+[Project website](https://rekurt.github.io/git-barber/) ·
+[All projects by rekurt](https://rekurt.github.io/projects/)
+
 ![demo](https://raw.githubusercontent.com/rekurt/git-barber/master/assets/demo.gif)
 
 ## Install

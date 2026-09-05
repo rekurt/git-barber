@@ -1,0 +1,22 @@
+name: Pages
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  release:
+    types: [published]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  pages:
+    uses: rekurt/rekurt.github.io/.github/workflows/project-pages.yml@main
+    with:
+      slug: git-barber
