@@ -120,6 +120,17 @@ assert rows["gone"]["selected_by_default"] is False
 assert all(rows[name]["selected_by_default"] for name in ("classic", "squash", "rebase", "reverted"))
 assert snapshot(repo) == before, "read-only commands changed fixture files"
 
+# Regression: custom log presentation must not remove commit boundaries.
+# Run this only against the teaching classifier; production code is unchanged.
+git("config", "format.pretty", "format:diff --git a/%h b/%h")
+git("config", "log.abbrevCommit", "true")
+git("config", "log.showSignature", "true")
+custom_before = snapshot(repo)
+custom_format = run(classifier, str(repo), "refs/heads/main", "refs/heads/rebase")
+assert custom_format == "ReplayedPatches", custom_format
+assert snapshot(repo) == custom_before
+print("Custom format.pretty / log.abbrevCommit / log.showSignature: ReplayedPatches")
+
 shallow = lab / "shallow"
 run("git", "clone", "--template=" + str(empty_template), "--no-local", "--depth", "1",
     "--no-single-branch", repo.as_uri(), str(shallow))
@@ -134,6 +145,7 @@ assert snapshot(shallow) == shallow_before
 (lab / "list.txt").write_text(listing + "\n")
 (lab / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 (lab / "verification.json").write_text(json.dumps({"classifier": observed, "shallow": "ShallowHistory",
+    "custom_log_format_rebase": custom_format,
     "all_fixture_files_unchanged_by_read_commands": True}, indent=2) + "\n")
 print(json.dumps(observed, indent=2))
 print(listing)

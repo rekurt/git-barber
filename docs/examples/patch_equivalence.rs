@@ -1,4 +1,5 @@
-//! Read-only teaching example; not a branch deletion policy.
+//! Inspection example for a trusted repository with all required objects local.
+//! Not a branch deletion policy; partial clones may lazily fetch objects.
 use std::{
     collections::HashSet,
     error::Error,
@@ -82,7 +83,15 @@ impl Git<'_> {
             .collect())
     }
     fn log_ids(&self, range: &str) -> Result<Vec<String>> {
-        let mut args = vec!["log", "-p", "--no-merges"];
+        // Pin headers as well as diff options: patch-id parses this stream.
+        let mut args = vec![
+            "log",
+            "-p",
+            "--no-merges",
+            "--format=medium",
+            "--no-abbrev-commit",
+            "--no-show-signature",
+        ];
         args.extend_from_slice(FLAGS);
         args.push(range);
         self.patches(&args)
