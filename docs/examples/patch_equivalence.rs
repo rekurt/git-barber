@@ -89,6 +89,7 @@ impl Git<'_> {
             "-p",
             "--no-merges",
             "--format=medium",
+            "--date=default",
             "--no-abbrev-commit",
             "--no-show-signature",
         ];

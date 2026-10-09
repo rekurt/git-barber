@@ -131,6 +131,18 @@ assert custom_format == "ReplayedPatches", custom_format
 assert snapshot(repo) == custom_before
 print("Custom format.pretty / log.abbrevCommit / log.showSignature: ReplayedPatches")
 
+# Isolate date rendering from pretty rendering. Medium includes a Date field.
+git("config", "format.pretty", "medium")
+fork = git("merge-base", "refs/heads/main", "refs/heads/rebase")
+combined = git("diff-tree", "-p", "-r", "--full-index", fork, "refs/heads/rebase")
+date_format = "format:\ncommit " + "0" * 40 + "\n" + combined.replace("%", "%%") + "\n\ncommit " + "0" * 40
+git("config", "log.date", date_format)
+date_before = snapshot(repo)
+custom_date = run(classifier, str(repo), "refs/heads/main", "refs/heads/rebase")
+assert custom_date == "ReplayedPatches", custom_date
+assert snapshot(repo) == date_before
+print("Custom log.date with literal newlines and a synthetic patch: ReplayedPatches")
+
 shallow = lab / "shallow"
 run("git", "clone", "--template=" + str(empty_template), "--no-local", "--depth", "1",
     "--no-single-branch", repo.as_uri(), str(shallow))
@@ -146,6 +158,7 @@ assert snapshot(shallow) == shallow_before
 (lab / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 (lab / "verification.json").write_text(json.dumps({"classifier": observed, "shallow": "ShallowHistory",
     "custom_log_format_rebase": custom_format,
+    "custom_log_date_rebase": custom_date,
     "all_fixture_files_unchanged_by_read_commands": True}, indent=2) + "\n")
 print(json.dumps(observed, indent=2))
 print(listing)

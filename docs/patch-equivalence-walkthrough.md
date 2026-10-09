@@ -14,7 +14,7 @@ Resolve both ref names to commit IDs once. An ancestry check comes first: `git m
 
 For a full history, find the merge base and collect patch IDs from non-merge commits in `FORK..BASE`. [Git's stable patch ID](https://git-scm.com/docs/git-patch-id) ignores whitespace and line numbers and is insensitive to file-diff order. It identifies likely duplicate patches; it does not establish semantic equivalence of programs. Use the same explicit diff options on both sides: configuration-dependent rename detection, diff algorithms or context could otherwise alter the input.
 
-Log presentation is input to the parser too. `format.pretty`, `log.abbrevCommit` and signature display can change that stream. Set `--format=medium --no-abbrev-commit --no-show-signature` explicitly for both log queries: full commit headers delimit patches and configured display text cannot masquerade as a diff. The lab uses a deliberately diff-shaped custom format on the existing replay fixture to test this boundary.
+Log presentation is input to the parser too. `format.pretty`, `log.date`, `log.abbrevCommit` and signature display can change that stream. Medium output contains a Date field; a custom strftime date can include literal newlines and diff-like text, so selecting medium alone is insufficient. Set `--format=medium --date=default --no-abbrev-commit --no-show-signature` explicitly for both log queries: full commit headers delimit patches, and the configured pretty/date text is excluded from the stream. These options address the tested presentation overrides; this is not a claim about every possible Git configuration. The lab separately tests a deliberately diff-shaped pretty format and a custom date containing literal newlines and a synthetic patch on the existing replay fixture.
 
 Compare the combined `diff-tree FORK BRANCH` patch against the base's individual patches. A match is squash-style evidence. If it misses, compare each non-merge branch commit with that set. Require at least one commit, no merge commits, one patch ID per commit, and membership for every ID. Empty commits produce no patch ID, so the count check prevents silently dropping them. Merge commits can contain conflict-resolution changes that `log --no-merges` omits. These guards apply to the replay stage; the combined-patch check ran earlier.
 
@@ -118,6 +118,7 @@ impl Git<'_> {
             "-p",
             "--no-merges",
             "--format=medium",
+            "--date=default",
             "--no-abbrev-commit",
             "--no-show-signature",
         ];
@@ -230,7 +231,7 @@ python3 docs/examples/patch_equivalence_lab.py "$lab_bin_dir/patch-equivalence" 
 
 The [lab script](examples/patch_equivalence_lab.py) creates fresh temporary repositories, an empty local bare remote, synthetic commits and a shallow file-URL clone. It isolates global/system Git configuration and disables fixture hooks. It performs no network fetch or branch deletion and retains the temporary directory for inspection. Its repository writes create the examples; classification and git-barber listings are checked separately for changes by hashing every fixture file before and after, including `.git`.
 
-The lab also sets `format.pretty` to `format:diff --git a/%h b/%h`, enables abbreviated commits and signature display, then asserts that the teaching classifier still reports the existing `rebase` fixture as `ReplayedPatches`. That regression fails with `Unknown` before log formatting is pinned. It does not run the unchanged product scanner under this custom configuration. Fixture files are hashed again around the regression query.
+The lab also sets `format.pretty` to `format:diff --git a/%h b/%h`, enables abbreviated commits and signature display, then asserts that the teaching classifier still reports the existing `rebase` fixture as `ReplayedPatches`. That regression fails with `Unknown` before log formatting is pinned. It then restores medium formatting and sets `log.date` to a literal multiline strftime format containing the combined replay patch between commit headers. Without `--date=default`, that date makes the teaching classifier incorrectly return `SquashPatch`; with the option it remains `ReplayedPatches`. Percent signs in the synthetic patch are escaped as `%%` for strftime. These two regressions run only against the teaching classifier, while the pinned product source is compared under the baseline configuration. Fixture files are hashed again around each query.
 
 These are the asserted classifier results:
 
