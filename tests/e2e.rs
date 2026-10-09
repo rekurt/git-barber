@@ -850,3 +850,163 @@ fn no_cache_neither_reads_nor_writes_the_cache() {
         "--no-cache must leave an existing cache untouched"
     );
 }
+
+#[test]
+fn log_format_preserves_squash_and_rebase_evidence() {
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "squashed"]);
+    commit_file(&dir, "sq-a.txt", "a", "squash a");
+    commit_file(&dir, "sq-b.txt", "b", "squash b");
+    git(&dir, &["checkout", "main"]);
+    git(&dir, &["merge", "--squash", "squashed"]);
+    git(&dir, &["commit", "-m", "integrate squash"]);
+    git(&dir, &["checkout", "-b", "replayed"]);
+    commit_file(&dir, "rb-a.txt", "a", "replay a");
+    let first = git(&dir, &["rev-parse", "HEAD"]).trim().to_owned();
+    commit_file(&dir, "rb-b.txt", "b", "replay b");
+    let second = git(&dir, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&dir, &["checkout", "main"]);
+    commit_file(&dir, "context.txt", "advance", "advance base");
+    git(&dir, &["cherry-pick", &first, &second]);
+    assert_ne!(git(&dir, &["rev-parse", "HEAD"]).trim(), second);
+
+    let expected = vec![
+        ("replayed".into(), "rebase".into()),
+        ("squashed".into(), "squash".into()),
+    ];
+    // First check the default, then change display settings in the same repo.
+    for pretty in [
+        None,
+        Some("medium"),
+        Some("oneline"),
+        Some("format:%h %s"),
+        Some("format:diff --git a/%h b/%h"),
+    ] {
+        if let Some(pretty) = pretty {
+            git(&dir, &["config", "format.pretty", pretty]);
+        }
+        for abbrev in ["false", "true"] {
+            git(&dir, &["config", "log.abbrevCommit", abbrev]);
+            for signature in ["false", "true"] {
+                git(&dir, &["config", "log.showSignature", signature]);
+                let output = barber(&dir)
+                    .args(["--json", "--no-cache"])
+                    .assert()
+                    .success();
+                let json = serde_json::from_slice(&output.get_output().stdout).unwrap();
+                let mut actual = branch_kinds(&json);
+                actual.sort();
+                assert_eq!(
+                    actual, expected,
+                    "pretty={pretty:?}, abbrev={abbrev}, signature={signature}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn log_format_rejects_a_patch_in_pretty_output() {
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "unmerged"]);
+    commit_file(&dir, "unmerged.txt", "not integrated", "unmerged topic");
+    git(&dir, &["checkout", "main"]);
+    commit_file(&dir, "base.txt", "unrelated", "advance base");
+    let fork = git(&dir, &["merge-base", "main", "unmerged"]);
+    let patch = git(
+        &dir,
+        &[
+            "diff-tree",
+            "-p",
+            "-r",
+            "--full-index",
+            fork.trim(),
+            "unmerged",
+        ],
+    );
+    // A valid pretty format injects a synthetic patch, then a full header
+    // separates it from the actual base diff. No such patch landed on main.
+    let pretty = format!(
+        "format:commit {}%n{}%n%ncommit %H",
+        "0".repeat(40),
+        patch.trim_end().replace('%', "%%").replace('\n', "%n"),
+    );
+    git(&dir, &["config", "format.pretty", &pretty]);
+    git(&dir, &["config", "log.abbrevCommit", "true"]);
+    git(&dir, &["config", "log.showSignature", "true"]);
+    assert!(!dir.join("unmerged.txt").exists());
+    let output = barber(&dir)
+        .args(["--json", "--no-cache"])
+        .assert()
+        .success();
+    let json = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert!(
+        branch_kinds(&json).is_empty(),
+        "pretty text must not become merge evidence: {json}"
+    );
+}
+
+#[test]
+fn log_format_invalidates_verdicts_from_the_previous_cache_rules() {
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "unmerged"]);
+    commit_file(&dir, "unmerged.txt", "not integrated", "unmerged topic");
+    git(&dir, &["checkout", "main"]);
+    commit_file(&dir, "base.txt", "unrelated", "advance base");
+    let base = git(&dir, &["rev-parse", "main"]);
+    let fork = git(&dir, &["merge-base", "main", "unmerged"]);
+    let branch = git(&dir, &["rev-parse", "unmerged"]);
+    let key = format!("{}:{}:{}", base.trim(), fork.trim(), branch.trim());
+    let cache = dir.join(".git/barber");
+    std::fs::create_dir(&cache).unwrap();
+    for version in [1, 2] {
+        let old = serde_json::json!({"version": version, "entries": {key.clone(): "squash"}});
+        std::fs::write(cache.join("cache.json"), old.to_string()).unwrap();
+        // Recompute even unchanged tips: v1 had unpinned pretty output,
+        // while the intermediate v2 rules still honoured custom dates.
+        let json = list_json(&dir);
+        assert!(
+            branch_kinds(&json).is_empty(),
+            "old cache version {version} survived: {json}"
+        );
+    }
+}
+
+#[test]
+fn log_format_rejects_a_patch_in_custom_date() {
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "unmerged"]);
+    commit_file(&dir, "unmerged.txt", "not integrated", "unmerged topic");
+    git(&dir, &["checkout", "main"]);
+    commit_file(&dir, "base.txt", "unrelated", "advance base");
+    let fork = git(&dir, &["merge-base", "main", "unmerged"]);
+    let patch = git(
+        &dir,
+        &[
+            "diff-tree",
+            "-p",
+            "-r",
+            "--full-index",
+            fork.trim(),
+            "unmerged",
+        ],
+    );
+    // Date uses strftime, not pretty placeholders: retain literal newlines
+    // and escape percent signs in the patch so they cannot become directives.
+    let date = format!(
+        "format:\ncommit {}\n{}\n\ncommit {}",
+        "0".repeat(40),
+        patch.trim_end().replace('%', "%%"),
+        "0".repeat(40),
+    );
+    git(&dir, &["config", "log.date", &date]);
+    let output = barber(&dir)
+        .args(["--json", "--no-cache"])
+        .assert()
+        .success();
+    let json = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert!(
+        branch_kinds(&json).is_empty(),
+        "custom date must not become merge evidence: {json}"
+    );
+}
