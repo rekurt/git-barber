@@ -36,7 +36,8 @@ struct Stored {
     entries: HashMap<String, Option<MergeKind>>,
 }
 
-const VERSION: u32 = 1;
+// Discard verdicts computed from configurable, unpinned log output.
+const VERSION: u32 = 2;
 
 #[derive(Default)]
 pub struct Cache {
@@ -242,7 +243,11 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("barber")).unwrap();
         std::fs::write(
             tmp.path().join("barber/cache.json"),
-            r#"{"version":1,"entries":{"b:f:x":"merged","b:f:y":"gone","b:f:z":"squash"}}"#,
+            serde_json::json!({
+                "version": VERSION,
+                "entries": {"b:f:x": "merged", "b:f:y": "gone", "b:f:z": "squash"}
+            })
+            .to_string(),
         )
         .unwrap();
 

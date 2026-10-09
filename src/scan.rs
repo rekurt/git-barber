@@ -521,6 +521,17 @@ const DIFF_FLAGS: [&str; 13] = [
     "--ignore-submodules=none",
 ];
 
+// patch-id consumes log headers as well as diffs. Fix their format so
+// custom pretty text cannot become patch evidence or obscure boundaries.
+const LOG_PREFIX: [&str; 6] = [
+    "log",
+    "-p",
+    "--no-merges",
+    "--format=medium",
+    "--no-abbrev-commit",
+    "--no-show-signature",
+];
+
 fn with_diff_flags(prefix: &[&str], range: &str) -> Vec<String> {
     prefix
         .iter()
@@ -542,10 +553,7 @@ fn merge_base(git: &dyn Git, base: &Base, branch_sha: &str) -> Result<Option<Str
 /// same fork point shares one walk — hence computing it per distinct fork
 /// point rather than per branch.
 fn upstream_patch_ids(git: &dyn Git, base: &Base, merge_base: &str) -> Result<HashSet<String>> {
-    let args = with_diff_flags(
-        &["log", "-p", "--no-merges"],
-        &format!("{merge_base}..{}", base.sha),
-    );
+    let args = with_diff_flags(&LOG_PREFIX, &format!("{merge_base}..{}", base.sha));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     Ok(patch_ids(git, &git.run(&refs)?)?.into_iter().collect())
 }
@@ -593,10 +601,7 @@ fn probe_branch(
     if merges.trim() != "0" {
         return Ok(None);
     }
-    let args = with_diff_flags(
-        &["log", "-p", "--no-merges"],
-        &format!("{merge_base}..{branch_sha}"),
-    );
+    let args = with_diff_flags(&LOG_PREFIX, &format!("{merge_base}..{branch_sha}"));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let branch_ids = patch_ids(git, &git.run(&refs)?)?;
     // Empty-diff commits emit no patch-id at all; requiring the counts to
@@ -921,7 +926,7 @@ mod tests {
         const SHA: &str = "basesha0";
         const BRANCH: &str = "feat111";
         fn log_args(range: &str) -> Vec<&str> {
-            let mut v = vec!["log", "-p", "--no-merges"];
+            let mut v = super::LOG_PREFIX.to_vec();
             v.extend_from_slice(&DIFF_FLAGS);
             v.push(range);
             v
@@ -1292,7 +1297,7 @@ mod tests {
 
         // Argv builders mirroring the production DIFF_FLAGS plumbing.
         fn log_args(range: &str) -> Vec<&str> {
-            let mut v = vec!["log", "-p", "--no-merges"];
+            let mut v = super::LOG_PREFIX.to_vec();
             v.extend_from_slice(&super::DIFF_FLAGS);
             v.push(range);
             v
@@ -1517,7 +1522,7 @@ mod tests {
             // upstream log blows up (e.g. corrupt object) — scan must survive
             .on(
                 &{
-                    let mut v = vec!["log", "-p", "--no-merges"];
+                    let mut v = super::LOG_PREFIX.to_vec();
                     v.extend_from_slice(&super::DIFF_FLAGS);
                     v.push("mb..abc");
                     v
