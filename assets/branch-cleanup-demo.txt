@@ -1,0 +1,10 @@
+$ git barber --base main --list --no-cache
+base: main
+  feature/squashed  squash    1m ago
+
+1 candidate(s), 1 selected by default. Run `git barber` for the TUI or `git barber --yes` to delete.
+
+$ git branch --list
+feature/squashed
+  feature/unmerged
+* main
