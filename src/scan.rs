@@ -523,11 +523,12 @@ const DIFF_FLAGS: [&str; 13] = [
 
 // patch-id consumes log headers as well as diffs. Fix their format so
 // custom pretty text cannot become patch evidence or obscure boundaries.
-const LOG_PREFIX: [&str; 6] = [
+const LOG_PREFIX: [&str; 7] = [
     "log",
     "-p",
     "--no-merges",
     "--format=medium",
+    "--date=default",
     "--no-abbrev-commit",
     "--no-show-signature",
 ];

@@ -36,8 +36,8 @@ struct Stored {
     entries: HashMap<String, Option<MergeKind>>,
 }
 
-// Discard verdicts computed from configurable, unpinned log output.
-const VERSION: u32 = 2;
+// Discard verdicts computed before log presentation and dates were pinned.
+const VERSION: u32 = 3;
 
 #[derive(Default)]
 pub struct Cache {

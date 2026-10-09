@@ -959,12 +959,54 @@ fn log_format_invalidates_verdicts_from_the_previous_cache_rules() {
     let key = format!("{}:{}:{}", base.trim(), fork.trim(), branch.trim());
     let cache = dir.join(".git/barber");
     std::fs::create_dir(&cache).unwrap();
-    let old = serde_json::json!({"version": 1, "entries": {key: "squash"}});
-    std::fs::write(cache.join("cache.json"), old.to_string()).unwrap();
-    // A cached false positive must be recomputed even with unchanged tips.
-    let json = list_json(&dir);
+    for version in [1, 2] {
+        let old = serde_json::json!({"version": version, "entries": {key.clone(): "squash"}});
+        std::fs::write(cache.join("cache.json"), old.to_string()).unwrap();
+        // Recompute even unchanged tips: v1 had unpinned pretty output,
+        // while the intermediate v2 rules still honoured custom dates.
+        let json = list_json(&dir);
+        assert!(
+            branch_kinds(&json).is_empty(),
+            "old cache version {version} survived: {json}"
+        );
+    }
+}
+
+#[test]
+fn log_format_rejects_a_patch_in_custom_date() {
+    let (_tmp, dir) = repo();
+    git(&dir, &["checkout", "-b", "unmerged"]);
+    commit_file(&dir, "unmerged.txt", "not integrated", "unmerged topic");
+    git(&dir, &["checkout", "main"]);
+    commit_file(&dir, "base.txt", "unrelated", "advance base");
+    let fork = git(&dir, &["merge-base", "main", "unmerged"]);
+    let patch = git(
+        &dir,
+        &[
+            "diff-tree",
+            "-p",
+            "-r",
+            "--full-index",
+            fork.trim(),
+            "unmerged",
+        ],
+    );
+    // Date uses strftime, not pretty placeholders: retain literal newlines
+    // and escape percent signs in the patch so they cannot become directives.
+    let date = format!(
+        "format:\ncommit {}\n{}\n\ncommit {}",
+        "0".repeat(40),
+        patch.trim_end().replace('%', "%%"),
+        "0".repeat(40),
+    );
+    git(&dir, &["config", "log.date", &date]);
+    let output = barber(&dir)
+        .args(["--json", "--no-cache"])
+        .assert()
+        .success();
+    let json = serde_json::from_slice(&output.get_output().stdout).unwrap();
     assert!(
         branch_kinds(&json).is_empty(),
-        "old unpinned verdict survived: {json}"
+        "custom date must not become merge evidence: {json}"
     );
 }
