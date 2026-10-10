@@ -1,0 +1,98 @@
+name: Reusable Git Barber cleanup
+
+on:
+  workflow_call:
+    inputs:
+      dry-run:
+        description: Report candidates without deleting branches
+        type: boolean
+        default: true
+      min-age-days:
+        description: Minimum age of the tip commit (at least 7 days)
+        type: number
+        default: 7
+      protect:
+        description: Additional protected branch globs, one per line
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: git-barber-cleanup-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'closed' &&
+       github.event.pull_request.merged == true &&
+       github.event.pull_request.base.ref == github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout cleanup tooling at its published commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: rekurt/git-barber
+          ref: bb039f05ec6cf2746d4e0f35d9a15722321be7f5
+          path: tooling
+          persist-credentials: false
+
+      - name: Checkout repository default branch with full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: target
+          fetch-depth: 0
+
+      - name: Install verified Git Barber v0.3.0 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=git-barber-v0.3.0-x86_64-unknown-linux-musl.tar.gz
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/rekurt/git-barber/releases/download/v0.3.0/$archive" \
+            --output "$RUNNER_TEMP/$archive"
+          echo "16820cee078da356c39a7ceb1bd22f81504ed2823b60573352ffc156b2540ab6  $RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/git-barber-v0.3.0-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+
+      - name: Prepare disposable detached checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C target fetch --prune origin '+refs/heads/*:refs/remotes/origin/*'
+          git -C target checkout --detach
+          while IFS= read -r branch; do
+            git -C target branch -D -- "$branch"
+          done < <(git -C target for-each-ref --format='%(refname:short)' refs/heads)
+
+      - name: Verify policy and clean merged branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPOSITORY: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          MIN_AGE_DAYS: ${{ inputs.min-age-days }}
+          PROTECT_PATTERNS: ${{ inputs.protect }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tooling/.github/scripts/branch_cleanup.py \
+            --repo target --repository "$TARGET_REPOSITORY" \
+            --binary "$(command -v git-barber)" --report-dir branch-cleanup-report \
+            --dry-run "$DRY_RUN" --min-age-days "$MIN_AGE_DAYS" \
+            --protect "$PROTECT_PATTERNS"
+
+      - name: Upload cleanup report and recovery commands
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: git-barber-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: branch-cleanup-report/
+          retention-days: 30
+          if-no-files-found: warn
