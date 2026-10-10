@@ -11,9 +11,9 @@ excluded. Every API page is read; API failures, missing history and verification
 warnings stop deletion. Eligibility is checked again before deleting, and Git
 Barber uses a lease against the scanned SHA to refuse concurrent remote changes.
 
-Add the following file as `.github/workflows/git-barber.yml`. Replace
-`WORKFLOW_COMMIT_SHA` with a reviewed commit containing `branch-cleanup.yml`.
-SHA-pinned callers stay on that implementation until explicitly updated.
+Add the following file as `.github/workflows/git-barber.yml`. The example pins the published implementation to an immutable commit. Review
+and replace the SHA when upgrading; callers stay on that implementation until
+explicitly updated.
 
 ```yaml
 name: Git Barber
@@ -35,7 +35,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.pull_request.merged == true &&
        github.event.pull_request.base.ref == github.event.repository.default_branch)
-    uses: rekurt/git-barber/.github/workflows/branch-cleanup.yml@WORKFLOW_COMMIT_SHA
+    uses: rekurt/git-barber/.github/workflows/branch-cleanup.yml@05dceb4fbab9f0945aa478a5726eb34ff40d09a5
     with:
       dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
       min-age-days: 7
