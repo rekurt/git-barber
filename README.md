@@ -67,6 +67,9 @@ own completion machinery instead.
 
 ## Usage
 
+For automatic cleanup after a GitHub PR merge, see the
+[GitHub Actions integration](docs/github-actions.md).
+
 ```bash
 git barber              # TUI: pick branches, confirm, done
 git barber --list       # dry-run listing (also the default outside a TTY)
